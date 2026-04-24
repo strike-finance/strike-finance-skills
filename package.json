@@ -1,0 +1,36 @@
+{
+  "name": "strike-finance-skills",
+  "version": "0.0.1",
+  "description": "AI coding assistant skills for Strike Finance integration — trading bots, builder APIs, and real-time market data",
+  "type": "module",
+  "bin": {
+    "strike-finance-skills": "./dist/cli.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "rm -rf dist && tsdown",
+    "dev": "tsdown --watch"
+  },
+  "keywords": [
+    "strike-finance",
+    "perpetuals",
+    "trading",
+    "ai-skills",
+    "claude",
+    "cursor",
+    "codex",
+    "copilot"
+  ],
+  "author": "Strike Finance",
+  "license": "MIT",
+  "dependencies": {
+    "commander": "^14.0.3",
+    "picocolors": "^1.1.1"
+  },
+  "devDependencies": {
+    "tsdown": "^0.12.4",
+    "typescript": "^5.8.3"
+  }
+}

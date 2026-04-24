@@ -1,0 +1,3156 @@
+openapi: 3.0.3
+info:
+  title: Strike Perpetuals - Trade REST API
+  description: Order management endpoints for Strike Perpetuals trading platform.
+  version: 2.1.0
+  contact:
+    name: Strike Finance
+    url: https://www.strikefinance.org
+  x-gitbook-description-document:
+    object: document
+    data:
+      schemaVersion: 9
+    nodes:
+      - object: block
+        type: paragraph
+        isVoid: false
+        data: {}
+        nodes:
+          - object: text
+            leaves:
+              - object: leaf
+                text: >-
+                  Order management endpoints for Strike Perpetuals trading
+                  platform.
+                marks: []
+            key: 0MoKrp5rfQeI
+        key: VGeNrKrcXmgz
+    key: s1rydNHFtAA0
+  x-gitbook-description-html: <p>Order management endpoints for Strike Perpetuals trading platform.</p>
+servers:
+  - url: https://api.strikefinance.org
+    description: Mainnet
+    x-gitbook-description-html: <p>Mainnet</p>
+  - url: https://api-v2-testnet.strikefinance.org
+    description: Testnet
+    x-gitbook-description-html: <p>Testnet</p>
+tags:
+  - name: Algo
+    description: Algorithmic trading strategies (TWAP)
+  - name: Orders
+    description: Order management (create, cancel, query)
+    x-gitbook-description-document:
+      object: document
+      data:
+        schemaVersion: 9
+      nodes:
+        - object: block
+          type: paragraph
+          isVoid: false
+          data: {}
+          nodes:
+            - object: text
+              leaves:
+                - object: leaf
+                  text: Order management (create, cancel, query)
+                  marks: []
+              key: oNkqehi4aueC
+          key: W9279238qRSN
+      key: 7OmeDHsWQtyI
+    x-gitbook-description-html: <p>Order management (create, cancel, query)</p>
+  - name: Trading
+    description: Leverage, margin mode, and isolated margin operations
+    x-gitbook-description-document:
+      object: document
+      data:
+        schemaVersion: 9
+      nodes:
+        - object: block
+          type: paragraph
+          isVoid: false
+          data: {}
+          nodes:
+            - object: text
+              leaves:
+                - object: leaf
+                  text: Leverage, margin mode, and isolated margin operations
+                  marks: []
+              key: HSy86yWGvDxk
+          key: eV9jJ3LN01Cv
+      key: nfVQW3Rkq1bE
+    x-gitbook-description-html: <p>Leverage, margin mode, and isolated margin operations</p>
+  - name: History
+    description: Order and fill history queries
+security:
+  - ApiWalletAuth: []
+components:
+  securitySchemes:
+    ApiWalletAuth:
+      type: apiKey
+      in: header
+      name: X-API-Wallet-Public-Key
+      description: >
+        Ed25519 signature-based authentication using API Wallets.
+
+
+        **Required Headers:**
+
+        - `X-API-Wallet-Public-Key`: Your Ed25519 public key (64 hex characters)
+
+        - `X-API-Wallet-Signature`: Ed25519 signature of the message (128 hex
+        characters)
+
+        - `X-API-Wallet-Timestamp`: Unix timestamp in seconds
+
+        - `X-API-Wallet-Nonce`: Unique UUID v4 per request
+
+
+        **Signature Message Format:**
+
+        ```
+
+        {METHOD}:{PATH}:{TIMESTAMP}:{NONCE}:{BODY_HASH}
+
+        ```
+      x-gitbook-description-html: >-
+        <p>Ed25519 signature-based authentication using API Wallets.</p>
+
+        <p><strong>Required Headers:</strong></p>
+
+        <ul>
+
+        <li><code>X-API-Wallet-Public-Key</code>: Your Ed25519 public key (64
+        hex characters)</li>
+
+        <li><code>X-API-Wallet-Signature</code>: Ed25519 signature of the
+        message (128 hex characters)</li>
+
+        <li><code>X-API-Wallet-Timestamp</code>: Unix timestamp in seconds</li>
+
+        <li><code>X-API-Wallet-Nonce</code>: Unique UUID v4 per request</li>
+
+        </ul>
+
+        <p><strong>Signature Message Format:</strong></p>
+
+        <pre><code>{METHOD}:{PATH}:{TIMESTAMP}:{NONCE}:{BODY_HASH}
+
+        </code></pre>
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+          description: Error message
+          x-gitbook-description-html: <p>Error message</p>
+        code:
+          type: string
+          description: Error code
+          x-gitbook-description-html: <p>Error code</p>
+        msg:
+          type: string
+          description: Error message (alternative format)
+          x-gitbook-description-html: <p>Error message (alternative format)</p>
+      required:
+        - error
+    CreateOrderRequest:
+      type: object
+      required:
+        - symbol
+        - side
+        - type
+        - size
+      properties:
+        client_order_id:
+          type: string
+          description: Client-provided order ID for tracking
+          example: my-order-001
+          x-gitbook-description-html: <p>Client-provided order ID for tracking</p>
+        symbol:
+          type: string
+          description: Trading pair symbol
+          example: BTC-USD
+          x-gitbook-description-html: <p>Trading pair symbol</p>
+        side:
+          type: string
+          enum:
+            - buy
+            - sell
+          description: Order side
+          example: buy
+          x-gitbook-description-html: <p>Order side</p>
+        type:
+          type: string
+          enum:
+            - limit
+            - market
+            - stop
+            - stop_limit
+            - take_profit
+            - take_profit_limit
+            - trailing_stop_market
+          description: Order type
+          example: limit
+          x-gitbook-description-html: <p>Order type</p>
+        size:
+          type: string
+          description: Order size in base asset
+          example: '0.1'
+          x-gitbook-description-html: <p>Order size in base asset</p>
+        price:
+          type: string
+          description: Order price (required for limit orders)
+          example: '50000.00'
+          x-gitbook-description-html: <p>Order price (required for limit orders)</p>
+        stop_price:
+          type: string
+          description: Trigger price for conditional orders
+          example: '49500.00'
+          x-gitbook-description-html: <p>Trigger price for conditional orders</p>
+        time_in_force:
+          type: string
+          enum:
+            - GTC
+            - IOC
+            - FOK
+          default: GTC
+          description: |
+            Time in force:
+            - GTC: Good Till Cancel
+            - IOC: Immediate Or Cancel
+            - FOK: Fill Or Kill
+          example: GTC
+          x-gitbook-description-html: |-
+            <p>Time in force:</p>
+            <ul>
+            <li>GTC: Good Till Cancel</li>
+            <li>IOC: Immediate Or Cancel</li>
+            <li>FOK: Fill Or Kill</li>
+            </ul>
+        working_type:
+          type: string
+          enum:
+            - mark_price
+            - contract_price
+          default: mark_price
+          description: Price type for trigger evaluation
+          x-gitbook-description-html: <p>Price type for trigger evaluation</p>
+        post_only:
+          type: boolean
+          default: false
+          description: If true, order will only be maker
+          x-gitbook-description-html: <p>If true, order will only be maker</p>
+        reduce_only:
+          type: boolean
+          default: false
+          description: If true, order can only reduce position
+          x-gitbook-description-html: <p>If true, order can only reduce position</p>
+        close_position:
+          type: boolean
+          default: false
+          description: If true, closes entire position when triggered
+          x-gitbook-description-html: <p>If true, closes entire position when triggered</p>
+        price_protect:
+          type: boolean
+          default: false
+          description: If true, enables price protection
+          x-gitbook-description-html: <p>If true, enables price protection</p>
+        vault_id:
+          type: string
+          description: Optional vault ID to trade on behalf of a vault (leader only)
+          example: vault-abc-123
+          x-gitbook-description-html: <p>Optional vault ID to trade on behalf of a vault (leader only)</p>
+        callback_rate:
+          type: string
+          description: >-
+            Trail distance as a percentage for trailing_stop_market orders.
+            Range: "0.1" to "5". E.g. "1" = 1%.
+          example: '5'
+          x-gitbook-description-html: >-
+            <p>Trail distance as a percentage for trailing_stop_market orders.
+            Range: "0.1" to "5". E.g. "1" = 1%.</p>
+        activation_price:
+          type: string
+          description: >-
+            Price at which trailing begins. Only for trailing_stop_market
+            orders. If omitted, trailing activates immediately at current
+            working price.
+          example: '67000'
+          x-gitbook-description-html: >-
+            <p>Price at which trailing begins. Only for trailing_stop_market
+            orders. If omitted, trailing activates immediately at current
+            working price.</p>
+        slippage:
+          type: string
+          description: >-
+            Slippage tolerance as a decimal fraction. Only for MARKET orders.
+            E.g. "0.05" = 5%. Clamped to the market's maximum price bound. If
+            omitted, the market default bound is used.
+          example: '0.05'
+          x-gitbook-description-html: >-
+            <p>Slippage tolerance as a decimal fraction. Only for MARKET orders.
+            E.g. "0.05" = 5%. Clamped to the market's maximum price bound. If
+            omitted, the market default bound is used.</p>
+    CreateOrderResponse:
+      type: object
+      properties:
+        client_order_id:
+          type: string
+          description: Client-provided order ID
+          example: my-order-001
+          x-gitbook-description-html: <p>Client-provided order ID</p>
+        account_id:
+          type: string
+          description: Account ID
+          example: 01234567-89ab-cdef-0123-456789abcdef
+          x-gitbook-description-html: <p>Account ID</p>
+        symbol:
+          type: string
+          description: Trading pair symbol
+          example: BTC-USD
+          x-gitbook-description-html: <p>Trading pair symbol</p>
+        sequence_id:
+          type: integer
+          format: int64
+          description: Sequence ID for ordering
+          example: 789012
+          x-gitbook-description-html: <p>Sequence ID for ordering</p>
+        message_id:
+          type: string
+          description: Message ID for tracking
+          example: msg_xyz
+          x-gitbook-description-html: <p>Message ID for tracking</p>
+    Order:
+      type: object
+      description: |
+        Order model. Field names are PascalCase in JSON responses.
+      properties:
+        ID:
+          type: integer
+          format: int64
+          description: Order ID
+          example: 123456
+          x-gitbook-description-html: <p>Order ID</p>
+        ClientOrderID:
+          type: string
+          description: Client order ID
+          example: my-order-001
+          x-gitbook-description-html: <p>Client order ID</p>
+        AccountID:
+          type: string
+          description: Account ID
+          example: 01234567-89ab-cdef-0123-456789abcdef
+          x-gitbook-description-html: <p>Account ID</p>
+        Symbol:
+          type: string
+          description: Trading pair
+          example: BTC-USD
+          x-gitbook-description-html: <p>Trading pair</p>
+        Strategy:
+          type: object
+          nullable: true
+          description: Strategy linkage (only present for strategy orders)
+          x-gitbook-description-html: <p>Strategy linkage (only present for strategy orders)</p>
+          properties:
+            ID:
+              type: string
+              description: Strategy ID
+              x-gitbook-description-html: <p>Strategy ID</p>
+            IsPrimary:
+              type: boolean
+              description: Whether this is the primary order in the strategy
+              x-gitbook-description-html: <p>Whether this is the primary order in the strategy</p>
+        CloseReason:
+          type: string
+          description: Explains why the order was closed
+          example: ''
+          x-gitbook-description-html: <p>Explains why the order was closed</p>
+        Side:
+          type: string
+          enum:
+            - buy
+            - sell
+            - none
+          description: Order side
+          example: buy
+          x-gitbook-description-html: <p>Order side</p>
+        Status:
+          type: string
+          enum:
+            - pending
+            - open
+            - filled
+            - canceled
+            - untriggered
+            - rejected
+            - expired
+            - none
+          description: Order status
+          example: filled
+          x-gitbook-description-html: <p>Order status</p>
+        Type:
+          type: string
+          enum:
+            - limit
+            - market
+            - stop
+            - stop_limit
+            - take_profit
+            - take_profit_limit
+            - trailing_stop_market
+          description: Order type
+          example: limit
+          x-gitbook-description-html: <p>Order type</p>
+        OriginType:
+          type: string
+          enum:
+            - limit
+            - market
+            - stop
+            - stop_limit
+            - take_profit
+            - take_profit_limit
+            - trailing_stop_market
+          description: Original type of a triggered conditional order
+          example: stop_limit
+          x-gitbook-description-html: <p>Original type of a triggered conditional order</p>
+        AutoCloseType:
+          type: string
+          enum:
+            - liquidation
+            - adl
+            - bankrupt
+            - if_transfer
+            - ''
+          description: Auto-close type (for liquidation/ADL orders)
+          example: ''
+          x-gitbook-description-html: <p>Auto-close type (for liquidation/ADL orders)</p>
+        TimeInForce:
+          type: string
+          enum:
+            - GTC
+            - IOC
+            - FOK
+          description: Time in force
+          example: GTC
+          x-gitbook-description-html: <p>Time in force</p>
+        WorkingType:
+          type: string
+          enum:
+            - mark_price
+            - contract_price
+            - none
+          description: Working type for triggers
+          example: mark_price
+          x-gitbook-description-html: <p>Working type for triggers</p>
+        Size:
+          type: string
+          description: Original order size
+          example: '0.1'
+          x-gitbook-description-html: <p>Original order size</p>
+        Filled:
+          type: string
+          description: Filled quantity
+          example: '0.1'
+          x-gitbook-description-html: <p>Filled quantity</p>
+        Price:
+          type: string
+          description: Order price
+          example: '50000.00'
+          x-gitbook-description-html: <p>Order price</p>
+        StopPrice:
+          type: string
+          description: Stop/trigger price
+          example: '0'
+          x-gitbook-description-html: <p>Stop/trigger price</p>
+        BoundPrice:
+          type: string
+          description: Bound price for market orders
+          example: '0'
+          x-gitbook-description-html: <p>Bound price for market orders</p>
+        PostOnly:
+          type: boolean
+          description: Post-only flag
+          example: false
+          x-gitbook-description-html: <p>Post-only flag</p>
+        ReduceOnly:
+          type: boolean
+          description: Reduce-only flag
+          example: false
+          x-gitbook-description-html: <p>Reduce-only flag</p>
+        ClosePosition:
+          type: boolean
+          description: Close position flag
+          example: false
+          x-gitbook-description-html: <p>Close position flag</p>
+        PriceProtect:
+          type: boolean
+          description: Price protection flag
+          example: false
+          x-gitbook-description-html: <p>Price protection flag</p>
+        CallbackRate:
+          type: string
+          nullable: true
+          description: >-
+            Trail distance in percent (e.g. "5" = 5%). Null for non-trailing
+            orders.
+          example: '5'
+          x-gitbook-description-html: >-
+            <p>Trail distance in percent (e.g. "5" = 5%). Null for non-trailing
+            orders.</p>
+        ActivationPrice:
+          type: string
+          nullable: true
+          description: >-
+            Price at which trailing began. If originally omitted, shows the
+            resolved working price. Null for non-trailing orders.
+          example: '67000'
+          x-gitbook-description-html: >-
+            <p>Price at which trailing began. If originally omitted, shows the
+            resolved working price. Null for non-trailing orders.</p>
+        TrailingExtreme:
+          type: string
+          nullable: true
+          description: >-
+            Best price seen since activation (highest for sell, lowest for buy).
+            Updates on each favorable tick. Null for non-trailing orders.
+          example: '70000'
+          x-gitbook-description-html: >-
+            <p>Best price seen since activation (highest for sell, lowest for
+            buy). Updates on each favorable tick. Null for non-trailing
+            orders.</p>
+        TrailingActivated:
+          type: boolean
+          nullable: true
+          description: >-
+            True if the trailing stop has crossed its activation threshold. Null
+            for non-trailing orders.
+          example: true
+          x-gitbook-description-html: >-
+            <p>True if the trailing stop has crossed its activation threshold.
+            Null for non-trailing orders.</p>
+        CreateTimestamp:
+          type: integer
+          format: int64
+          description: When the API received the order (ms)
+          example: 1704067200000
+          x-gitbook-description-html: <p>When the API received the order (ms)</p>
+        EntryTimestamp:
+          type: integer
+          format: int64
+          description: When the engine received the order (ms)
+          example: 1704067200050
+          x-gitbook-description-html: <p>When the engine received the order (ms)</p>
+        EventTimestamp:
+          type: integer
+          format: int64
+          description: Last event time (ms)
+          example: 1704067200150
+          x-gitbook-description-html: <p>Last event time (ms)</p>
+      x-gitbook-description-html: <p>Order model. Field names are PascalCase in JSON responses.</p>
+    CancelOrderRequest:
+      type: object
+      required:
+        - order_id
+        - symbol
+      properties:
+        order_id:
+          type: integer
+          format: int64
+          description: Order ID to cancel
+          example: 123456
+          x-gitbook-description-html: <p>Order ID to cancel</p>
+        symbol:
+          type: string
+          description: Trading pair symbol
+          example: BTC-USD
+          x-gitbook-description-html: <p>Trading pair symbol</p>
+        vault_id:
+          type: string
+          description: Optional vault ID to cancel on behalf of a vault (leader only)
+          example: vault-abc-123
+          x-gitbook-description-html: >-
+            <p>Optional vault ID to cancel on behalf of a vault (leader
+            only)</p>
+    CancelOrderResponse:
+      type: object
+      properties:
+        order_id:
+          type: integer
+          format: int64
+          description: Canceled order ID
+          example: 123456
+          x-gitbook-description-html: <p>Canceled order ID</p>
+        symbol:
+          type: string
+          description: Trading pair symbol
+          example: BTC-USD
+          x-gitbook-description-html: <p>Trading pair symbol</p>
+        sequence_id:
+          type: integer
+          format: int64
+          description: Sequence ID
+          example: 789012
+          x-gitbook-description-html: <p>Sequence ID</p>
+        message_id:
+          type: string
+          description: Message ID
+          example: msg_xyz
+          x-gitbook-description-html: <p>Message ID</p>
+    CancelAllOrdersRequest:
+      type: object
+      properties:
+        symbol:
+          type: string
+          description: >-
+            Optional symbol filter. If empty, cancels all orders across all
+            symbols.
+          example: BTC-USD
+          x-gitbook-description-html: >-
+            <p>Optional symbol filter. If empty, cancels all orders across all
+            symbols.</p>
+        vault_id:
+          type: string
+          description: Optional vault ID to cancel on behalf of a vault (leader only)
+          example: vault-abc-123
+          x-gitbook-description-html: >-
+            <p>Optional vault ID to cancel on behalf of a vault (leader
+            only)</p>
+    CancelAllOrdersResponse:
+      type: object
+      properties:
+        account_id:
+          type: string
+          description: Account ID
+          example: 01234567-89ab-cdef-0123-456789abcdef
+          x-gitbook-description-html: <p>Account ID</p>
+        symbol:
+          type: string
+          description: Symbol filter used
+          example: BTC-USD
+          x-gitbook-description-html: <p>Symbol filter used</p>
+        canceled_count:
+          type: integer
+          description: Number of orders canceled (-1 = async, count not available)
+          example: -1
+          x-gitbook-description-html: <p>Number of orders canceled (-1 = async, count not available)</p>
+        sequence_id:
+          type: integer
+          format: int64
+          description: Sequence ID
+          example: 789012
+          x-gitbook-description-html: <p>Sequence ID</p>
+        message_id:
+          type: string
+          description: Message ID
+          example: msg_xyz
+          x-gitbook-description-html: <p>Message ID</p>
+    OpenOrdersResponse:
+      type: object
+      properties:
+        orders:
+          type: array
+          items:
+            $ref: '#/components/schemas/Order'
+        count:
+          type: integer
+          description: Number of open orders
+          example: 5
+          x-gitbook-description-html: <p>Number of open orders</p>
+    StrategyOrderDetails:
+      type: object
+      required:
+        - type
+        - size
+        - stop_price
+      properties:
+        client_order_id:
+          type: string
+          description: Client order ID for this leg
+          example: tp-001
+          x-gitbook-description-html: <p>Client order ID for this leg</p>
+        type:
+          type: string
+          enum:
+            - take_profit
+            - take_profit_limit
+            - stop
+            - stop_limit
+          description: Order type for TP/SL leg
+          example: take_profit
+          x-gitbook-description-html: <p>Order type for TP/SL leg</p>
+        size:
+          type: string
+          description: Order size
+          example: '0.1'
+          x-gitbook-description-html: <p>Order size</p>
+        price:
+          type: string
+          description: Limit price (for limit types)
+          example: '52000.00'
+          x-gitbook-description-html: <p>Limit price (for limit types)</p>
+        stop_price:
+          type: string
+          description: Trigger price
+          example: '52000.00'
+          x-gitbook-description-html: <p>Trigger price</p>
+        time_in_force:
+          type: string
+          enum:
+            - GTC
+            - IOC
+            - FOK
+          description: Time in force
+          example: GTC
+          x-gitbook-description-html: <p>Time in force</p>
+        working_type:
+          type: string
+          enum:
+            - mark_price
+            - contract_price
+          description: Working type
+          example: mark_price
+          x-gitbook-description-html: <p>Working type</p>
+        post_only:
+          type: boolean
+          description: Post-only flag
+          example: false
+          x-gitbook-description-html: <p>Post-only flag</p>
+        price_protect:
+          type: boolean
+          description: Price protection
+          example: false
+          x-gitbook-description-html: <p>Price protection</p>
+    CreateStrategyOrderRequest:
+      type: object
+      required:
+        - strategy_id
+        - symbol
+        - side
+        - type
+        - size
+      properties:
+        strategy_id:
+          type: string
+          description: Client-provided strategy ID
+          example: strategy-001
+          x-gitbook-description-html: <p>Client-provided strategy ID</p>
+        client_order_id:
+          type: string
+          description: Client order ID for primary order
+          example: primary-001
+          x-gitbook-description-html: <p>Client order ID for primary order</p>
+        symbol:
+          type: string
+          description: Trading pair symbol
+          example: BTC-USD
+          x-gitbook-description-html: <p>Trading pair symbol</p>
+        side:
+          type: string
+          enum:
+            - buy
+            - sell
+          description: Order side
+          example: buy
+          x-gitbook-description-html: <p>Order side</p>
+        type:
+          type: string
+          enum:
+            - limit
+            - market
+          description: Primary order type
+          example: limit
+          x-gitbook-description-html: <p>Primary order type</p>
+        size:
+          type: string
+          description: Order size
+          example: '0.1'
+          x-gitbook-description-html: <p>Order size</p>
+        price:
+          type: string
+          description: Order price (for limit orders)
+          example: '50000.00'
+          x-gitbook-description-html: <p>Order price (for limit orders)</p>
+        stop_price:
+          type: string
+          description: Trigger price for conditional primary orders
+          example: '49500.00'
+          x-gitbook-description-html: <p>Trigger price for conditional primary orders</p>
+        time_in_force:
+          type: string
+          enum:
+            - GTC
+            - IOC
+            - FOK
+          description: Time in force
+          example: GTC
+          x-gitbook-description-html: <p>Time in force</p>
+        working_type:
+          type: string
+          enum:
+            - mark_price
+            - contract_price
+          description: Price type for trigger evaluation
+          x-gitbook-description-html: <p>Price type for trigger evaluation</p>
+        post_only:
+          type: boolean
+          default: false
+          description: If true, primary order will only be maker
+          x-gitbook-description-html: <p>If true, primary order will only be maker</p>
+        reduce_only:
+          type: boolean
+          default: false
+          description: If true, primary order can only reduce position
+          x-gitbook-description-html: <p>If true, primary order can only reduce position</p>
+        close_position:
+          type: boolean
+          default: false
+          description: If true, closes entire position when triggered
+          x-gitbook-description-html: <p>If true, closes entire position when triggered</p>
+        price_protect:
+          type: boolean
+          default: false
+          description: If true, enables price protection
+          x-gitbook-description-html: <p>If true, enables price protection</p>
+        vault_id:
+          type: string
+          description: Optional vault ID to trade on behalf of a vault (leader only)
+          example: vault-abc-123
+          x-gitbook-description-html: <p>Optional vault ID to trade on behalf of a vault (leader only)</p>
+        tp_order:
+          $ref: '#/components/schemas/StrategyOrderDetails'
+          description: Take-profit order configuration
+          x-gitbook-description-html: <p>Take-profit order configuration</p>
+        sl_order:
+          $ref: '#/components/schemas/StrategyOrderDetails'
+          description: Stop-loss order configuration
+          x-gitbook-description-html: <p>Stop-loss order configuration</p>
+    CreateStrategyOrderResponse:
+      type: object
+      properties:
+        strategy_id:
+          type: string
+          description: Strategy ID
+          example: strategy-001
+          x-gitbook-description-html: <p>Strategy ID</p>
+        primary_client_order_id:
+          type: string
+          description: Primary order client ID
+          example: primary-001
+          x-gitbook-description-html: <p>Primary order client ID</p>
+        tp_client_order_id:
+          type: string
+          description: Take-profit order client ID
+          example: tp-001
+          x-gitbook-description-html: <p>Take-profit order client ID</p>
+        sl_client_order_id:
+          type: string
+          description: Stop-loss order client ID
+          example: sl-001
+          x-gitbook-description-html: <p>Stop-loss order client ID</p>
+        account_id:
+          type: string
+          description: Account ID
+          example: 01234567-89ab-cdef-0123-456789abcdef
+          x-gitbook-description-html: <p>Account ID</p>
+        symbol:
+          type: string
+          description: Trading pair
+          example: BTC-USD
+          x-gitbook-description-html: <p>Trading pair</p>
+        sequence_id:
+          type: integer
+          format: int64
+          description: Sequence ID
+          example: 789012
+          x-gitbook-description-html: <p>Sequence ID</p>
+        message_id:
+          type: string
+          description: Message ID
+          example: msg_xyz
+          x-gitbook-description-html: <p>Message ID</p>
+    CreateBatchOrdersRequest:
+      type: object
+      required:
+        - orders
+      properties:
+        orders:
+          type: array
+          description: Array of orders to create (minimum 1)
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/CreateOrderRequest'
+          x-gitbook-description-html: <p>Array of orders to create (minimum 1)</p>
+        vault_id:
+          type: string
+          description: Optional vault ID to trade on behalf of a vault (leader only)
+          example: vault-abc-123
+          x-gitbook-description-html: <p>Optional vault ID to trade on behalf of a vault (leader only)</p>
+    CreateBatchOrdersResponse:
+      type: object
+      properties:
+        successful:
+          type: array
+          description: Successfully created orders
+          items:
+            $ref: '#/components/schemas/CreateOrderResponse'
+          x-gitbook-description-html: <p>Successfully created orders</p>
+        failed:
+          type: array
+          description: Orders that failed to create
+          items:
+            type: object
+            properties:
+              index:
+                type: integer
+                description: Index of the failed order in the request array
+                example: 2
+                x-gitbook-description-html: <p>Index of the failed order in the request array</p>
+              error:
+                type: string
+                description: Error message
+                example: insufficient margin
+                x-gitbook-description-html: <p>Error message</p>
+          x-gitbook-description-html: <p>Orders that failed to create</p>
+    ReplaceOrderRequest:
+      type: object
+      required:
+        - cancel
+        - new_order
+      properties:
+        cancel:
+          $ref: '#/components/schemas/CancelOrderRequest'
+          description: The order to cancel
+          x-gitbook-description-html: <p>The order to cancel</p>
+        new_order:
+          $ref: '#/components/schemas/CreateOrderRequest'
+          description: The new order to create
+          x-gitbook-description-html: <p>The new order to create</p>
+        vault_id:
+          type: string
+          description: Optional vault ID to replace on behalf of a vault (leader only)
+          example: vault-abc-123
+          x-gitbook-description-html: >-
+            <p>Optional vault ID to replace on behalf of a vault (leader
+            only)</p>
+    ReplaceOrderResponse:
+      type: object
+      properties:
+        cancel:
+          $ref: '#/components/schemas/CancelOrderResponse'
+        new_order:
+          $ref: '#/components/schemas/CreateOrderResponse'
+    ReplaceBatchOrdersRequest:
+      type: object
+      required:
+        - replacements
+      properties:
+        replacements:
+          type: array
+          description: Array of replace operations (minimum 1)
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/ReplaceOrderRequest'
+          x-gitbook-description-html: <p>Array of replace operations (minimum 1)</p>
+        vault_id:
+          type: string
+          description: Optional vault ID to replace on behalf of a vault (leader only)
+          example: vault-abc-123
+          x-gitbook-description-html: >-
+            <p>Optional vault ID to replace on behalf of a vault (leader
+            only)</p>
+    ReplaceBatchOrdersResponse:
+      type: object
+      properties:
+        results:
+          type: array
+          description: Results for each replacement operation
+          items:
+            $ref: '#/components/schemas/ReplaceOrderResponse'
+          x-gitbook-description-html: <p>Results for each replacement operation</p>
+    CreateTwapRequest:
+      type: object
+      required:
+        - symbol
+        - side
+        - total_size
+        - duration_sec
+      properties:
+        symbol:
+          type: string
+          description: Trading pair symbol
+          example: BTC-USDT
+        side:
+          type: string
+          enum:
+            - BUY
+            - SELL
+          description: Order side
+          example: BUY
+        total_size:
+          type: string
+          description: Total quantity to execute (decimal string)
+          example: '1.5'
+        duration_sec:
+          type: integer
+          description: Execution duration in seconds (min 300, max 86400)
+          minimum: 300
+          maximum: 86400
+          example: 3600
+        limit_price:
+          type: string
+          description: >-
+            Optional hard cap price. Slices whose projected fill price would
+            cross it are skipped.
+          example: '45000.00'
+        reduce_only:
+          type: boolean
+          default: false
+          description: If true, slices can only reduce an existing position
+        randomize:
+          type: boolean
+          default: false
+          description: Enable time/size jitter to reduce predictability
+    CreateTwapResponse:
+      type: object
+      properties:
+        strategy_id:
+          type: string
+          description: Unique strategy identifier (UUID v7)
+          example: 019681a3-7e00-7000-8000-000000000001
+        status:
+          type: string
+          description: Initial status (always "active")
+          example: active
+    CancelTwapResponse:
+      type: object
+      properties:
+        strategy_id:
+          type: string
+          description: Strategy identifier
+          example: 019681a3-7e00-7000-8000-000000000001
+        status:
+          type: string
+          description: Status after cancellation request (always "cancelling")
+          example: cancelling
+    TwapStrategyView:
+      type: object
+      properties:
+        strategy_id:
+          type: string
+          description: Unique strategy identifier
+          example: 019681a3-7e00-7000-8000-000000000001
+        account_id:
+          type: string
+          description: Account that owns the strategy
+          example: 01234567-89ab-cdef-0123-456789abcdef
+        market:
+          type: string
+          description: Trading pair symbol
+          example: BTC-USDT
+        status:
+          type: string
+          enum:
+            - pending
+            - active
+            - cancelling
+            - completed
+            - cancelled
+            - expired
+            - failed
+            - liquidated
+          description: Current strategy status
+          example: active
+        side:
+          type: string
+          enum:
+            - BUY
+            - SELL
+          description: Order side
+          example: BUY
+        total_size:
+          type: string
+          description: Total quantity to execute
+          example: '1.5'
+        filled_size:
+          type: string
+          description: Quantity executed so far
+          example: '0.75'
+        duration_sec:
+          type: integer
+          description: Execution duration in seconds
+          example: 3600
+        slices_fired:
+          type: integer
+          description: Number of child orders placed so far
+          example: 60
+        nominal_slices:
+          type: integer
+          description: Expected total number of slices
+          example: 120
+        created_at_ms:
+          type: integer
+          format: int64
+          description: Creation timestamp (ms)
+          example: 1713806400000
+        updated_at_ms:
+          type: integer
+          format: int64
+          description: Last update timestamp (ms)
+          example: 1713810000000
+        completed_at_ms:
+          type: integer
+          format: int64
+          nullable: true
+          description: Completion timestamp (ms), null while active
+          example: null
+        last_error:
+          type: string
+          description: Error message if strategy failed
+          example: ''
+    OrderHistoryEntry:
+      type: object
+      description: >
+        Order history entry. Includes all standard Order fields plus
+        strategy linkage when the order belongs to a TWAP or bracket
+        strategy.
+      properties:
+        ID:
+          type: integer
+          format: int64
+          description: Order ID
+          example: 123456
+        ClientOrderID:
+          type: string
+          description: Client order ID
+          example: twap-019681a3-1
+        AccountID:
+          type: string
+          description: Account ID
+          example: 01234567-89ab-cdef-0123-456789abcdef
+        Symbol:
+          type: string
+          description: Trading pair
+          example: BTC-USDT
+        Strategy:
+          type: object
+          nullable: true
+          description: Strategy linkage (present for TWAP / bracket orders)
+          properties:
+            ID:
+              type: string
+              description: Parent strategy ID
+            IsPrimary:
+              type: boolean
+              description: Whether this is the primary order in the strategy
+        Side:
+          type: string
+          example: buy
+        Status:
+          type: string
+          example: filled
+        Type:
+          type: string
+          example: market
+        Size:
+          type: string
+          example: '0.125'
+        Filled:
+          type: string
+          example: '0.125'
+        Price:
+          type: string
+          example: '45000.00'
+        CreateTimestamp:
+          type: integer
+          format: int64
+          example: 1713806400000
+        EventTimestamp:
+          type: integer
+          format: int64
+          example: 1713806400150
+    FillHistoryEntry:
+      type: object
+      properties:
+        trade_id:
+          type: integer
+          format: int64
+          description: Unique fill identifier
+          example: 789012
+        order_id:
+          type: integer
+          format: int64
+          description: Parent order ID
+          example: 123456
+        symbol:
+          type: string
+          example: BTC-USDT
+        side:
+          type: string
+          example: buy
+        price:
+          type: string
+          example: '45000.00'
+        size:
+          type: string
+          example: '0.125'
+        fee:
+          type: string
+          example: '0.005625'
+        fee_type:
+          type: string
+          example: taker
+        realized_pnl:
+          type: string
+          example: '0'
+        timestamp:
+          type: integer
+          format: int64
+          example: 1713806400150
+    LeverageRequest:
+      type: object
+      required:
+        - symbol
+        - leverage
+      properties:
+        symbol:
+          type: string
+          description: Trading pair symbol
+          example: BTC-USD
+          x-gitbook-description-html: <p>Trading pair symbol</p>
+        leverage:
+          type: integer
+          minimum: 1
+          maximum: 125
+          description: New leverage value
+          example: 10
+          x-gitbook-description-html: <p>New leverage value</p>
+        vault_id:
+          type: string
+          description: >-
+            Optional vault ID. When provided, updates leverage for the vault
+            account. Caller must be the vault leader.
+          x-gitbook-description-html: >-
+            <p>Optional vault ID. When provided, updates leverage for the vault
+            account. Caller must be the vault leader.</p>
+    LeverageResponse:
+      type: object
+      properties:
+        leverage:
+          type: integer
+          description: New leverage value
+          example: 10
+          x-gitbook-description-html: <p>New leverage value</p>
+        maxNotionalValue:
+          type: string
+          description: Maximum notional value at this leverage
+          example: '1000000'
+          x-gitbook-description-html: <p>Maximum notional value at this leverage</p>
+        symbol:
+          type: string
+          description: Trading pair symbol
+          example: BTC-USD
+          x-gitbook-description-html: <p>Trading pair symbol</p>
+    MarginModeRequest:
+      type: object
+      required:
+        - symbol
+        - marginMode
+      properties:
+        symbol:
+          type: string
+          description: Trading pair symbol
+          example: BTC-USD
+          x-gitbook-description-html: <p>Trading pair symbol</p>
+        marginMode:
+          type: string
+          enum:
+            - cross
+            - isolated
+          description: New margin mode
+          example: isolated
+          x-gitbook-description-html: <p>New margin mode</p>
+        vault_id:
+          type: string
+          description: >-
+            Optional vault ID. When provided, updates margin mode for the vault
+            account. Caller must be the vault leader.
+          x-gitbook-description-html: >-
+            <p>Optional vault ID. When provided, updates margin mode for the
+            vault account. Caller must be the vault leader.</p>
+    MarginModeResponse:
+      type: object
+      properties:
+        marginMode:
+          type: string
+          description: New margin mode
+          example: isolated
+          x-gitbook-description-html: <p>New margin mode</p>
+        symbol:
+          type: string
+          description: Trading pair symbol
+          example: BTC-USD
+          x-gitbook-description-html: <p>Trading pair symbol</p>
+    ModifyMarginRequest:
+      type: object
+      required:
+        - symbol
+        - amount
+        - modify_type
+      properties:
+        symbol:
+          type: string
+          description: Trading pair symbol
+          example: BTC-USD
+          x-gitbook-description-html: <p>Trading pair symbol</p>
+        amount:
+          type: string
+          description: Amount to add or remove
+          example: '500.00'
+          x-gitbook-description-html: <p>Amount to add or remove</p>
+        modify_type:
+          type: string
+          description: Modify type (add|remove)
+          example: add|remove
+          x-gitbook-description-html: <p>Modify type (add|remove)</p>
+        vault_id:
+          type: string
+          description: >-
+            Optional vault ID. When provided, modifies margin for the vault's
+            isolated position. Caller must be the vault leader.
+          x-gitbook-description-html: >-
+            <p>Optional vault ID. When provided, modifies margin for the vault's
+            isolated position. Caller must be the vault leader.</p>
+    ModifyMarginResponse:
+      type: object
+      properties:
+        symbol:
+          type: string
+          description: Trading pair symbol
+          example: BTC-USD
+          x-gitbook-description-html: <p>Trading pair symbol</p>
+        sequence_id:
+          type: integer
+          format: int64
+          description: Sequence ID
+          example: 789012
+          x-gitbook-description-html: <p>Sequence ID</p>
+        message_id:
+          type: string
+          description: Message ID
+          example: msg_xyz
+          x-gitbook-description-html: <p>Message ID</p>
+  responses:
+    MissingParameter:
+      description: Missing required parameter
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: MISSING_PARAMETER
+            code: MISSING_PARAMETER
+            msg: symbol parameter is required
+      x-gitbook-description-html: <p>Missing required parameter</p>
+    InvalidParameter:
+      description: Invalid parameter value
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: INVALID_PARAMETER
+            code: INVALID_PARAMETER
+            msg: invalid parameter
+      x-gitbook-description-html: <p>Invalid parameter value</p>
+    Unauthorized:
+      description: Unauthorized - missing or invalid API wallet authentication
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          examples:
+            missing_headers:
+              summary: Missing authentication headers
+              value:
+                error: missing API wallet authentication headers
+            invalid_signature:
+              summary: Invalid or expired signature
+              value:
+                error: authentication failed
+      x-gitbook-description-html: <p>Unauthorized - missing or invalid API wallet authentication</p>
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: not found
+      x-gitbook-description-html: <p>Resource not found</p>
+paths:
+  /v2/order:
+    post:
+      tags:
+        - Orders
+      summary: Create new order
+      description: >
+        Create a new order. Supports the following order types:
+
+
+        | Type | Description |
+
+        |------|-------------|
+
+        | `limit` | Limit order at specified price |
+
+        | `market` | Market order at best available price |
+
+        | `stop` | Stop market order triggered at stop_price |
+
+        | `stop_limit` | Stop limit order triggered at stop_price |
+
+        | `take_profit` | Take profit market order |
+
+        | `take_profit_limit` | Take profit limit order |
+
+        | `trailing_stop_market` | Trailing stop market order that tracks price
+        movement |
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateOrderRequest'
+            examples:
+              limit_order:
+                summary: Limit buy order
+                value:
+                  symbol: BTC-USD
+                  side: buy
+                  type: limit
+                  size: '0.1'
+                  price: '50000.00'
+                  time_in_force: GTC
+              market_order:
+                summary: Market sell order
+                value:
+                  symbol: BTC-USD
+                  side: sell
+                  type: market
+                  size: '0.1'
+              stop_order:
+                summary: Stop loss order
+                value:
+                  symbol: BTC-USD
+                  side: sell
+                  type: stop
+                  size: '0.1'
+                  stop_price: '48000.00'
+                  reduce_only: true
+              trailing_stop_order:
+                summary: Trailing stop loss order
+                value:
+                  symbol: BTC-USD
+                  side: sell
+                  type: trailing_stop_market
+                  size: '1'
+                  callback_rate: '5'
+                  activation_price: '67000'
+                  working_type: contract_price
+                  reduce_only: true
+              trailing_stop_immediate:
+                summary: Trailing stop with immediate activation
+                value:
+                  symbol: BTC-USD
+                  side: sell
+                  type: trailing_stop_market
+                  size: '1'
+                  callback_rate: '3'
+                  working_type: contract_price
+                  reduce_only: true
+      responses:
+        '201':
+          description: Order created successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateOrderResponse'
+          x-gitbook-description-html: <p>Order created successfully</p>
+        '400':
+          $ref: '#/components/responses/InvalidParameter'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+      x-gitbook-description-document:
+        object: document
+        data:
+          schemaVersion: 9
+        nodes:
+          - object: block
+            type: paragraph
+            isVoid: false
+            data: {}
+            nodes:
+              - object: text
+                leaves:
+                  - object: leaf
+                    text: 'Create a new order. Supports the following order types:'
+                    marks: []
+                key: fk4DKARBBPNv
+            key: HqAwUM1lb3dS
+          - object: block
+            type: table
+            isVoid: true
+            data:
+              records:
+                3jq2ZgNmCHhK:
+                  orderIndex: '0|hzzzv3:'
+                  values:
+                    uW5vm6akuOoA: iRYEiZEE2PIo
+                    573YqvXpY6kA: 9nut5yetQJtn
+                rSQXRNT4UTUG:
+                  orderIndex: '0|i000nr:'
+                  values:
+                    uW5vm6akuOoA: qby7gmX6p0d9
+                    573YqvXpY6kA: 5lZZSij8g6Jz
+                L6VAqgrIn7xe:
+                  orderIndex: '0|i000pj:'
+                  values:
+                    uW5vm6akuOoA: UhTKN0HYx09n
+                    573YqvXpY6kA: pvrNaad8jZrU
+                G3UTWbKF30XA:
+                  orderIndex: '0|i00127:'
+                  values:
+                    uW5vm6akuOoA: 4M7N8OBxPvLi
+                    573YqvXpY6kA: fD6WkeOC6CeP
+                pqhXq37MOzuX:
+                  orderIndex: '0|i001hb:'
+                  values:
+                    uW5vm6akuOoA: bjZFMHxnKeki
+                    573YqvXpY6kA: n5IQ9Aq32w8z
+                uNOKxnagO88t:
+                  orderIndex: '0|i002cf:'
+                  values:
+                    uW5vm6akuOoA: t3nhBMf9gBVo
+                    573YqvXpY6kA: Asju7WOrLq3T
+                3XRoc4rC76HR:
+                  orderIndex: '0|i0035r:'
+                  values:
+                    uW5vm6akuOoA: etG1PtHMTuTy
+                    573YqvXpY6kA: ikpKy8RvNN1e
+              definition:
+                uW5vm6akuOoA:
+                  id: uW5vm6akuOoA
+                  title: Type
+                  type: text
+                  textAlignment: left
+                573YqvXpY6kA:
+                  id: 573YqvXpY6kA
+                  title: Description
+                  type: text
+                  textAlignment: left
+              view:
+                type: grid
+                columns:
+                  - uW5vm6akuOoA
+                  - 573YqvXpY6kA
+                useNewSizing: true
+                hideHeader: false
+                stickyHeader: false
+                columnWidths: {}
+            nodes:
+              - object: text
+                leaves:
+                  - object: leaf
+                    text: ''
+                    marks: []
+                key: kffqQF6ryKk8
+            key: 84swHu7lig4V
+            fragments:
+              - object: fragment
+                nodes:
+                  - object: block
+                    type: paragraph
+                    isVoid: false
+                    data: {}
+                    nodes:
+                      - object: text
+                        leaves:
+                          - object: leaf
+                            text: limit
+                            marks:
+                              - object: mark
+                                type: code
+                                data: {}
+                        key: bumw0uN2epCd
+                    key: NQ64cQRY8KKq
+                key: ls388AImS6fg
+                fragment: iRYEiZEE2PIo
+                type: table-cell
+              - object: fragment
+                nodes:
+                  - object: block
+                    type: paragraph
+                    isVoid: false
+                    data: {}
+                    nodes:
+                      - object: text
+                        leaves:
+                          - object: leaf
+                            text: Limit order at specified price
+                            marks: []
+                        key: 30lvuj2uU3HV
+                    key: gp8sG0bU7Hyg
+                key: Gl97gd2Tz36j
+                fragment: 9nut5yetQJtn
+                type: table-cell
+              - object: fragment
+                nodes:
+                  - object: block
+                    type: paragraph
+                    isVoid: false
+                    data: {}
+                    nodes:
+                      - object: text
+                        leaves:
+                          - object: leaf
+                            text: market
+                            marks:
+                              - object: mark
+                                type: code
+                                data: {}
+                        key: emQty7MwcB4f
+                    key: 6Ue4Zyz4APX8
+                key: c1LG3iYlCAtG
+                fragment: qby7gmX6p0d9
+                type: table-cell
+              - object: fragment
+                nodes:
+                  - object: block
+                    type: paragraph
+                    isVoid: false
+                    data: {}
+                    nodes:
+                      - object: text
+                        leaves:
+                          - object: leaf
+                            text: Market order at best available price
+                            marks: []
+                        key: rXqlwJ1xVb7c
+                    key: jpjmDZN8GCha
+                key: 3WUOXLOw9k6M
+                fragment: 5lZZSij8g6Jz
+                type: table-cell
+              - object: fragment
+                nodes:
+                  - object: block
+                    type: paragraph
+                    isVoid: false
+                    data: {}
+                    nodes:
+                      - object: text
+                        leaves:
+                          - object: leaf
+                            text: stop
+                            marks:
+                              - object: mark
+                                type: code
+                                data: {}
+                        key: 5EwR15Ae5Td2
+                    key: ZVR3Ywj0ssoF
+                key: hYAbAMeEqHTL
+                fragment: UhTKN0HYx09n
+                type: table-cell
+              - object: fragment
+                nodes:
+                  - object: block
+                    type: paragraph
+                    isVoid: false
+                    data: {}
+                    nodes:
+                      - object: text
+                        leaves:
+                          - object: leaf
+                            text: Stop market order triggered at stop_price
+                            marks: []
+                        key: 7g0svnEP2x11
+                    key: fhUDnUQuLnKS
+                key: I0vbkkaGZ88d
+                fragment: pvrNaad8jZrU
+                type: table-cell
+              - object: fragment
+                nodes:
+                  - object: block
+                    type: paragraph
+                    isVoid: false
+                    data: {}
+                    nodes:
+                      - object: text
+                        leaves:
+                          - object: leaf
+                            text: stop_limit
+                            marks:
+                              - object: mark
+                                type: code
+                                data: {}
+                        key: uU5ZcaCOufOu
+                    key: Yczf3KnmAZhl
+                key: 8dHtsoYKBXVO
+                fragment: 4M7N8OBxPvLi
+                type: table-cell
+              - object: fragment
+                nodes:
+                  - object: block
+                    type: paragraph
+                    isVoid: false
+                    data: {}
+                    nodes:
+                      - object: text
+                        leaves:
+                          - object: leaf
+                            text: Stop limit order triggered at stop_price
+                            marks: []
+                        key: 6130gzH46OcY
+                    key: 6Ypl0hi3io79
+                key: fwHK045j7kiK
+                fragment: fD6WkeOC6CeP
+                type: table-cell
+              - object: fragment
+                nodes:
+                  - object: block
+                    type: paragraph
+                    isVoid: false
+                    data: {}
+                    nodes:
+                      - object: text
+                        leaves:
+                          - object: leaf
+                            text: take_profit
+                            marks:
+                              - object: mark
+                                type: code
+                                data: {}
+                        key: u3SYRboCY57s
+                    key: 1XU1YWf8Ausv
+                key: xvkYNgc14pjC
+                fragment: bjZFMHxnKeki
+                type: table-cell
+              - object: fragment
+                nodes:
+                  - object: block
+                    type: paragraph
+                    isVoid: false
+                    data: {}
+                    nodes:
+                      - object: text
+                        leaves:
+                          - object: leaf
+                            text: Take profit market order
+                            marks: []
+                        key: RvV8I7rV8hrr
+                    key: BHuf0BuyMyN4
+                key: ppR5M9dASnT5
+                fragment: n5IQ9Aq32w8z
+                type: table-cell
+              - object: fragment
+                nodes:
+                  - object: block
+                    type: paragraph
+                    isVoid: false
+                    data: {}
+                    nodes:
+                      - object: text
+                        leaves:
+                          - object: leaf
+                            text: take_profit_limit
+                            marks:
+                              - object: mark
+                                type: code
+                                data: {}
+                        key: OL4wMtjsJ1dg
+                    key: 03hhe6neomhm
+                key: FANrJM7ABXfJ
+                fragment: t3nhBMf9gBVo
+                type: table-cell
+              - object: fragment
+                nodes:
+                  - object: block
+                    type: paragraph
+                    isVoid: false
+                    data: {}
+                    nodes:
+                      - object: text
+                        leaves:
+                          - object: leaf
+                            text: Take profit limit order
+                            marks: []
+                        key: FI1wnPhbeYRf
+                    key: hLKGtVlEEmJy
+                key: e32cXB0kIMwA
+                fragment: Asju7WOrLq3T
+                type: table-cell
+              - object: fragment
+                nodes:
+                  - object: block
+                    type: paragraph
+                    isVoid: false
+                    data: {}
+                    nodes:
+                      - object: text
+                        leaves:
+                          - object: leaf
+                            text: trailing_stop_market
+                            marks:
+                              - object: mark
+                                type: code
+                                data: {}
+                        key: 1bUcTbGollPy
+                    key: GnaC9V6iAl0k
+                key: wm7neV1dZIgR
+                fragment: etG1PtHMTuTy
+                type: table-cell
+              - object: fragment
+                nodes:
+                  - object: block
+                    type: paragraph
+                    isVoid: false
+                    data: {}
+                    nodes:
+                      - object: text
+                        leaves:
+                          - object: leaf
+                            text: >-
+                              Trailing stop market order that tracks price
+                              movement
+                            marks: []
+                        key: 1mkm04WF1lnF
+                    key: 9ZCFyMhPJrJQ
+                key: xRLJZR3G7EjT
+                fragment: ikpKy8RvNN1e
+                type: table-cell
+        key: LWynuEQKGmrk
+      x-gitbook-description-html: >-
+        <p>Create a new order. Supports the following order
+        types:</p><table><thead><tr><th>Type</th><th>Description</th></tr></thead><tbody><tr><td><code>limit</code></td><td>Limit
+        order at specified
+        price</td></tr><tr><td><code>market</code></td><td>Market order at best
+        available price</td></tr><tr><td><code>stop</code></td><td>Stop market
+        order triggered at
+        stop_price</td></tr><tr><td><code>stop_limit</code></td><td>Stop limit
+        order triggered at
+        stop_price</td></tr><tr><td><code>take_profit</code></td><td>Take profit
+        market
+        order</td></tr><tr><td><code>take_profit_limit</code></td><td>Take
+        profit limit
+        order</td></tr><tr><td><code>trailing_stop_market</code></td><td>Trailing
+        stop market order that tracks price movement</td></tr></tbody></table>
+    get:
+      tags:
+        - Orders
+      summary: Get order by ID
+      description: >-
+        Get a specific order by order_id or client_order_id. At least one ID
+        must be provided. Supports unauthenticated access when vault_id is
+        provided.
+      parameters:
+        - name: symbol
+          in: query
+          required: true
+          description: Trading pair symbol
+          schema:
+            type: string
+          example: BTC-USD
+          x-gitbook-description-html: <p>Trading pair symbol</p>
+        - name: order_id
+          in: query
+          required: false
+          description: Server-assigned order ID
+          schema:
+            type: integer
+            format: int64
+          x-gitbook-description-html: <p>Server-assigned order ID</p>
+        - name: client_order_id
+          in: query
+          required: false
+          description: Client-provided order ID
+          schema:
+            type: string
+          x-gitbook-description-html: <p>Client-provided order ID</p>
+        - name: vault_id
+          in: query
+          required: false
+          description: >-
+            Vault ID for public vault order queries (no authentication required
+            when provided)
+          schema:
+            type: string
+          x-gitbook-description-html: >-
+            <p>Vault ID for public vault order queries (no authentication
+            required when provided)</p>
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+          x-gitbook-description-html: <p>Successful response</p>
+        '400':
+          $ref: '#/components/responses/MissingParameter'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+      x-gitbook-description-document:
+        object: document
+        data:
+          schemaVersion: 9
+        nodes:
+          - object: block
+            type: paragraph
+            isVoid: false
+            data: {}
+            nodes:
+              - object: text
+                leaves:
+                  - object: leaf
+                    text: >-
+                      Get a specific order by order_id or client_order_id. At
+                      least one ID must be provided. Supports unauthenticated
+                      access when vault_id is provided.
+                    marks: []
+                key: fkZvlQpRtnf0
+            key: THjwvaqWdt1q
+        key: LXykMlqc7WEL
+      x-gitbook-description-html: >-
+        <p>Get a specific order by order_id or client_order_id. At least one ID
+        must be provided. Supports unauthenticated access when vault_id is
+        provided.</p>
+  /v2/order/cancel:
+    delete:
+      tags:
+        - Orders
+      summary: Cancel order
+      description: Cancel a specific order by order_id.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CancelOrderRequest'
+      responses:
+        '200':
+          description: Cancel request submitted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CancelOrderResponse'
+          x-gitbook-description-html: <p>Cancel request submitted</p>
+        '400':
+          $ref: '#/components/responses/InvalidParameter'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+      x-gitbook-description-document:
+        object: document
+        data:
+          schemaVersion: 9
+        nodes:
+          - object: block
+            type: paragraph
+            isVoid: false
+            data: {}
+            nodes:
+              - object: text
+                leaves:
+                  - object: leaf
+                    text: Cancel a specific order by order_id.
+                    marks: []
+                key: yTUj4pNnS1KO
+            key: OdflVtBkTcyp
+        key: GtOR34gk2pA6
+      x-gitbook-description-html: <p>Cancel a specific order by order_id.</p>
+  /v2/order/cancel-all:
+    delete:
+      tags:
+        - Orders
+      summary: Cancel all orders
+      description: >-
+        Cancel all open orders. Optionally filter by symbol to cancel only
+        orders for a specific trading pair.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CancelAllOrdersRequest'
+      responses:
+        '200':
+          description: Cancel request submitted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CancelAllOrdersResponse'
+          x-gitbook-description-html: <p>Cancel request submitted</p>
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+      x-gitbook-description-document:
+        object: document
+        data:
+          schemaVersion: 9
+        nodes:
+          - object: block
+            type: paragraph
+            isVoid: false
+            data: {}
+            nodes:
+              - object: text
+                leaves:
+                  - object: leaf
+                    text: >-
+                      Cancel all open orders. Optionally filter by symbol to
+                      cancel only orders for a specific trading pair.
+                    marks: []
+                key: 0nYhsDaco7w6
+            key: AYFbFalM8eRy
+        key: RcwYuhg5VNgD
+      x-gitbook-description-html: >-
+        <p>Cancel all open orders. Optionally filter by symbol to cancel only
+        orders for a specific trading pair.</p>
+  /v2/order/strategy:
+    post:
+      tags:
+        - Orders
+      summary: Create strategy order (bracket order)
+      description: >
+        Create a strategy order with optional take-profit (TP) and stop-loss
+        (SL) orders.
+
+
+        **Requirements:**
+
+        - At least one of `tp_order` or `sl_order` must be provided
+
+        - The primary order executes first
+
+        - TP/SL orders are placed when the primary order fills
+
+        - If one TP/SL triggers, the other is automatically canceled
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateStrategyOrderRequest'
+            examples:
+              bracket_order:
+                summary: Long position with TP and SL
+                value:
+                  strategy_id: strategy-001
+                  client_order_id: entry-001
+                  symbol: BTC-USD
+                  side: buy
+                  type: limit
+                  size: '0.1'
+                  price: '50000.00'
+                  tp_order:
+                    type: take_profit
+                    size: '0.1'
+                    stop_price: '55000.00'
+                  sl_order:
+                    type: stop
+                    size: '0.1'
+                    stop_price: '48000.00'
+      responses:
+        '201':
+          description: Strategy order created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateStrategyOrderResponse'
+          x-gitbook-description-html: <p>Strategy order created</p>
+        '400':
+          $ref: '#/components/responses/InvalidParameter'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+      x-gitbook-description-document:
+        object: document
+        data:
+          schemaVersion: 9
+        nodes:
+          - object: block
+            type: paragraph
+            isVoid: false
+            data: {}
+            nodes:
+              - object: text
+                leaves:
+                  - object: leaf
+                    text: >-
+                      Create a strategy order with optional take-profit (TP) and
+                      stop-loss (SL) orders.
+                    marks: []
+                key: kmLIkzqt4wxf
+            key: 5dHEAgXpEr16
+          - object: block
+            type: paragraph
+            isVoid: false
+            data: {}
+            nodes:
+              - object: text
+                leaves:
+                  - object: leaf
+                    text: 'Requirements:'
+                    marks:
+                      - object: mark
+                        type: bold
+                        data: {}
+                key: R5qwjEvvoydm
+            key: 5mKnzhd4J8J7
+          - object: block
+            type: list-unordered
+            isVoid: false
+            data: {}
+            nodes:
+              - object: block
+                type: list-item
+                isVoid: false
+                data: {}
+                nodes:
+                  - object: block
+                    type: paragraph
+                    isVoid: false
+                    data: {}
+                    nodes:
+                      - object: text
+                        leaves:
+                          - object: leaf
+                            text: 'At least one of '
+                            marks: []
+                          - object: leaf
+                            text: tp_order
+                            marks:
+                              - object: mark
+                                type: code
+                                data: {}
+                          - object: leaf
+                            text: ' or '
+                            marks: []
+                          - object: leaf
+                            text: sl_order
+                            marks:
+                              - object: mark
+                                type: code
+                                data: {}
+                          - object: leaf
+                            text: ' must be provided'
+                            marks: []
+                        key: 61eZaMtJkxxw
+                    key: t2QWASTskA5a
+                key: B7mc3RDffuko
+              - object: block
+                type: list-item
+                isVoid: false
+                data: {}
+                nodes:
+                  - object: block
+                    type: paragraph
+                    isVoid: false
+                    data: {}
+                    nodes:
+                      - object: text
+                        leaves:
+                          - object: leaf
+                            text: The primary order executes first
+                            marks: []
+                        key: lng1sM3Ban63
+                    key: pptRE8v64kKO
+                key: by9UR9XzTR3G
+              - object: block
+                type: list-item
+                isVoid: false
+                data: {}
+                nodes:
+                  - object: block
+                    type: paragraph
+                    isVoid: false
+                    data: {}
+                    nodes:
+                      - object: text
+                        leaves:
+                          - object: leaf
+                            text: >-
+                              TP/SL orders are placed when the primary order
+                              fills
+                            marks: []
+                        key: EfKGPyuCAysK
+                    key: 4cDKSaNiDeXd
+                key: YdBKH0zHDkzE
+              - object: block
+                type: list-item
+                isVoid: false
+                data: {}
+                nodes:
+                  - object: block
+                    type: paragraph
+                    isVoid: false
+                    data: {}
+                    nodes:
+                      - object: text
+                        leaves:
+                          - object: leaf
+                            text: >-
+                              If one TP/SL triggers, the other is automatically
+                              canceled
+                            marks: []
+                        key: BV5ugqiOU2Bc
+                    key: r2WK0XTNznwh
+                key: cpkqwHoa6tdH
+            key: Yf1QvM3TCofm
+        key: ODvTvylZqd5P
+      x-gitbook-description-html: >-
+        <p>Create a strategy order with optional take-profit (TP) and stop-loss
+        (SL) orders.</p><p><strong>Requirements:</strong></p><ul><li>At least
+        one of <code>tp_order</code> or <code>sl_order</code> must be
+        provided</li><li>The primary order executes first</li><li>TP/SL orders
+        are placed when the primary order fills</li><li>If one TP/SL triggers,
+        the other is automatically canceled</li></ul>
+  /v2/orders/batch:
+    post:
+      tags:
+        - Orders
+      summary: Create batch orders
+      description: >
+        Create multiple orders in a single request. Each order is processed
+        independently — some may succeed while others fail. The response always
+        returns HTTP 200 with both successful and failed results.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateBatchOrdersRequest'
+            examples:
+              batch_limit_orders:
+                summary: Multiple limit orders
+                value:
+                  orders:
+                    - symbol: BTC-USD
+                      side: buy
+                      type: limit
+                      size: '0.1'
+                      price: '49000.00'
+                    - symbol: BTC-USD
+                      side: buy
+                      type: limit
+                      size: '0.1'
+                      price: '48000.00'
+      responses:
+        '200':
+          description: Batch processing complete (check individual results for failures)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateBatchOrdersResponse'
+          x-gitbook-description-html: >-
+            <p>Batch processing complete (check individual results for
+            failures)</p>
+        '400':
+          $ref: '#/components/responses/InvalidParameter'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+      x-gitbook-description-html: >-
+        <p>Create multiple orders in a single request. Each order is processed
+        independently — some may succeed while others fail. The response always
+        returns HTTP 200 with both successful and failed results.</p>
+      x-gitbook-description-document:
+        object: document
+        data:
+          schemaVersion: 9
+        nodes:
+          - object: block
+            type: paragraph
+            isVoid: false
+            data: {}
+            nodes:
+              - object: text
+                leaves:
+                  - object: leaf
+                    text: >-
+                      Create multiple orders in a single request. Each order is
+                      processed independently — some may succeed while others
+                      fail. The response always returns HTTP 200 with both
+                      successful and failed results.
+                    marks: []
+                key: ajlS5vaerEwc
+            key: 3mHQ2B1BJ42x
+        key: cAS0SySBCJEv
+  /v2/order/replace:
+    post:
+      tags:
+        - Orders
+      summary: Replace order
+      description: >
+        Atomically cancel an existing order and create a new one. The cancel is
+        executed first; if it fails, the new order is not created.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReplaceOrderRequest'
+            examples:
+              replace_limit:
+                summary: Replace a limit order with new price
+                value:
+                  cancel:
+                    order_id: 123456
+                    symbol: BTC-USD
+                  new_order:
+                    symbol: BTC-USD
+                    side: buy
+                    type: limit
+                    size: '0.1'
+                    price: '49500.00'
+      responses:
+        '200':
+          description: Order replaced successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReplaceOrderResponse'
+          x-gitbook-description-html: <p>Order replaced successfully</p>
+        '400':
+          $ref: '#/components/responses/InvalidParameter'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+      x-gitbook-description-html: >-
+        <p>Atomically cancel an existing order and create a new one. The cancel
+        is executed first; if it fails, the new order is not created.</p>
+      x-gitbook-description-document:
+        object: document
+        data:
+          schemaVersion: 9
+        nodes:
+          - object: block
+            type: paragraph
+            isVoid: false
+            data: {}
+            nodes:
+              - object: text
+                leaves:
+                  - object: leaf
+                    text: >-
+                      Atomically cancel an existing order and create a new one.
+                      The cancel is executed first; if it fails, the new order
+                      is not created.
+                    marks: []
+                key: pKQ6jcrREQch
+            key: oEjb54wyrk0s
+        key: o2tdhGAWHcPt
+  /v2/order/replace-batch:
+    post:
+      tags:
+        - Orders
+      summary: Replace batch orders
+      description: >
+        Replace multiple orders in a single request. Each replacement is an
+        atomic cancel + create pair. If any individual cancel fails, the entire
+        batch is aborted.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReplaceBatchOrdersRequest'
+            examples:
+              replace_batch:
+                summary: Replace multiple limit orders
+                value:
+                  replacements:
+                    - cancel:
+                        order_id: 123456
+                        symbol: BTC-USD
+                      new_order:
+                        symbol: BTC-USD
+                        side: buy
+                        type: limit
+                        size: '0.1'
+                        price: '49500.00'
+                    - cancel:
+                        order_id: 123457
+                        symbol: BTC-USD
+                      new_order:
+                        symbol: BTC-USD
+                        side: sell
+                        type: limit
+                        size: '0.1'
+                        price: '51500.00'
+      responses:
+        '200':
+          description: Batch replacement complete
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReplaceBatchOrdersResponse'
+          x-gitbook-description-html: <p>Batch replacement complete</p>
+        '400':
+          $ref: '#/components/responses/InvalidParameter'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+      x-gitbook-description-html: >-
+        <p>Replace multiple orders in a single request. Each replacement is an
+        atomic cancel + create pair. If any individual cancel fails, the entire
+        batch is aborted.</p>
+      x-gitbook-description-document:
+        object: document
+        data:
+          schemaVersion: 9
+        nodes:
+          - object: block
+            type: paragraph
+            isVoid: false
+            data: {}
+            nodes:
+              - object: text
+                leaves:
+                  - object: leaf
+                    text: >-
+                      Replace multiple orders in a single request. Each
+                      replacement is an atomic cancel + create pair. If any
+                      individual cancel fails, the entire batch is aborted.
+                    marks: []
+                key: X9Vdlipoih5z
+            key: 5N0kMuv2ju0y
+        key: 6WfBNs9TB0wN
+  /v2/openOrders:
+    get:
+      tags:
+        - Orders
+      summary: Get open orders
+      description: >-
+        Get all open orders for the account. Optionally filter by symbol.
+        Supports unauthenticated access when vault_id is provided.
+      parameters:
+        - name: symbol
+          in: query
+          required: false
+          description: Filter by trading pair symbol
+          schema:
+            type: string
+          example: BTC-USD
+          x-gitbook-description-html: <p>Filter by trading pair symbol</p>
+        - name: vault_id
+          in: query
+          required: false
+          description: >-
+            Vault ID for public vault order queries (no authentication required
+            when provided)
+          schema:
+            type: string
+          x-gitbook-description-html: >-
+            <p>Vault ID for public vault order queries (no authentication
+            required when provided)</p>
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OpenOrdersResponse'
+          x-gitbook-description-html: <p>Successful response</p>
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+      x-gitbook-description-document:
+        object: document
+        data:
+          schemaVersion: 9
+        nodes:
+          - object: block
+            type: paragraph
+            isVoid: false
+            data: {}
+            nodes:
+              - object: text
+                leaves:
+                  - object: leaf
+                    text: >-
+                      Get all open orders for the account. Optionally filter by
+                      symbol. Supports unauthenticated access when vault_id is
+                      provided.
+                    marks: []
+                key: g4y4EK7NtlG3
+            key: XnPTYuk1v0cE
+        key: kTaFyQx1StDb
+      x-gitbook-description-html: >-
+        <p>Get all open orders for the account. Optionally filter by symbol.
+        Supports unauthenticated access when vault_id is provided.</p>
+  /v2/algo/twap:
+    post:
+      tags:
+        - Algo
+      summary: Create TWAP strategy
+      description: >
+        Create a new TWAP (Time-Weighted Average Price) strategy. The strategy
+        splits a large order into smaller slices executed at regular intervals
+        over the specified duration.
+
+
+        **Constraints:**
+
+        - `duration_sec`: 300 (5 min) to 86400 (24 hr)
+
+        - `total_size`: must exceed the market's minimum order size
+
+        - Per-slice size must exceed the market's minimum order size
+
+        - Maximum 20 concurrent non-terminal strategies per account
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateTwapRequest'
+            examples:
+              basic_twap:
+                summary: Basic BUY TWAP over 1 hour
+                value:
+                  symbol: BTC-USDT
+                  side: BUY
+                  total_size: '1.5'
+                  duration_sec: 3600
+              twap_with_limit:
+                summary: TWAP with limit price and jitter
+                value:
+                  symbol: BTC-USDT
+                  side: BUY
+                  total_size: '1.5'
+                  duration_sec: 3600
+                  limit_price: '45000.00'
+                  randomize: true
+      responses:
+        '201':
+          description: Strategy created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateTwapResponse'
+        '400':
+          description: Invalid request (validation failure)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                bad_duration:
+                  value:
+                    error: 'invalid twap request: duration_sec must be >= 300'
+                bad_size:
+                  value:
+                    error: 'invalid twap request: total_size must be positive'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: Concurrent strategy limit reached (max 20)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: concurrent TWAP limit reached
+        '503':
+          description: Algo TWAP service not configured
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    get:
+      tags:
+        - Algo
+      summary: List TWAP strategies
+      description: >-
+        List TWAP strategies for the authenticated account. By default returns
+        only active and cancelling strategies.
+      parameters:
+        - name: status
+          in: query
+          required: false
+          description: >
+            Filter by status. Empty or "active" returns active + cancelling
+            strategies. "all" includes terminal statuses. Any other value
+            filters to that specific status.
+          schema:
+            type: string
+            enum:
+              - active
+              - all
+              - completed
+              - cancelled
+              - expired
+              - failed
+              - liquidated
+          example: active
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  strategies:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/TwapStrategyView'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          description: Algo TWAP service not configured
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /v2/algo/twap/{id}:
+    get:
+      tags:
+        - Algo
+      summary: Get TWAP strategy
+      description: Fetch details of a single TWAP strategy by ID.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Strategy ID (UUID)
+          schema:
+            type: string
+          example: 019681a3-7e00-7000-8000-000000000001
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TwapStrategyView'
+        '400':
+          description: Missing strategy ID
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          description: Algo TWAP service not configured
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    delete:
+      tags:
+        - Algo
+      summary: Cancel TWAP strategy
+      description: >-
+        Cancel an active TWAP strategy. The strategy transitions to
+        "cancelling" immediately. The bot-engine finalizes the cancellation
+        asynchronously once any in-flight child order completes.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Strategy ID (UUID)
+          schema:
+            type: string
+          example: 019681a3-7e00-7000-8000-000000000001
+      responses:
+        '200':
+          description: Cancel request accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CancelTwapResponse'
+        '400':
+          description: Missing strategy ID
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Strategy not found or not active
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: strategy not found or not active
+        '503':
+          description: Algo TWAP service not configured
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /v2/history/order:
+    get:
+      tags:
+        - History
+      summary: Get order history
+      description: >-
+        Query historical orders. Supports filtering by symbol, status, time
+        range, and source. Use source=twap to filter to TWAP child orders.
+        Supports unauthenticated access when account_id or vault_id is provided.
+      parameters:
+        - name: symbol
+          in: query
+          required: false
+          description: Filter by trading pair symbol
+          schema:
+            type: string
+          example: BTC-USDT
+        - name: status
+          in: query
+          required: false
+          description: Filter by order status (numeric enum value)
+          schema:
+            type: string
+        - name: order_id
+          in: query
+          required: false
+          description: Filter by specific order ID
+          schema:
+            type: string
+        - name: startTime
+          in: query
+          required: false
+          description: Start timestamp in milliseconds
+          schema:
+            type: string
+          example: '1713806400000'
+        - name: endTime
+          in: query
+          required: false
+          description: End timestamp in milliseconds
+          schema:
+            type: string
+          example: '1713892800000'
+        - name: limit
+          in: query
+          required: false
+          description: Max results (default 100, max 500)
+          schema:
+            type: string
+          example: '100'
+        - name: fromOrderID
+          in: query
+          required: false
+          description: Pagination cursor — returns orders with ID less than this value
+          schema:
+            type: string
+        - name: source
+          in: query
+          required: false
+          description: >-
+            Filter by order source. Use "twap" to return only TWAP child
+            orders (matches client_order_id prefix).
+          schema:
+            type: string
+            enum:
+              - twap
+          example: twap
+        - name: account_id
+          in: query
+          required: false
+          description: Account ID for public (unauthenticated) queries
+          schema:
+            type: string
+        - name: vault_id
+          in: query
+          required: false
+          description: Vault ID for public vault queries
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  orders:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/OrderHistoryEntry'
+                  count:
+                    type: integer
+                    description: Number of orders returned
+                    example: 25
+        '400':
+          $ref: '#/components/responses/InvalidParameter'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /v2/history/fill:
+    get:
+      tags:
+        - History
+      summary: Get fill history
+      description: >-
+        Query historical fills/trades. Supports filtering by symbol, order,
+        time range, and source. Use source=twap to filter to fills from TWAP
+        child orders. Supports unauthenticated access when account_id or
+        vault_id is provided.
+      parameters:
+        - name: symbol
+          in: query
+          required: false
+          description: Filter by trading pair symbol
+          schema:
+            type: string
+          example: BTC-USDT
+        - name: order_id
+          in: query
+          required: false
+          description: Filter fills from a specific order
+          schema:
+            type: string
+        - name: startTime
+          in: query
+          required: false
+          description: Start timestamp in milliseconds
+          schema:
+            type: string
+          example: '1713806400000'
+        - name: endTime
+          in: query
+          required: false
+          description: End timestamp in milliseconds
+          schema:
+            type: string
+          example: '1713892800000'
+        - name: limit
+          in: query
+          required: false
+          description: Max results (default 500, max 1000)
+          schema:
+            type: string
+          example: '500'
+        - name: fromId
+          in: query
+          required: false
+          description: >-
+            Backward pagination cursor — returns fills with ID less than
+            this value (descending order)
+          schema:
+            type: string
+        - name: since_trade_id
+          in: query
+          required: false
+          description: >-
+            Forward pagination cursor — returns fills with trade_id greater
+            than this value (ascending order). Cannot be used with fromId.
+          schema:
+            type: string
+        - name: source
+          in: query
+          required: false
+          description: >-
+            Filter by order source. Use "twap" to return only fills from TWAP
+            child orders.
+          schema:
+            type: string
+            enum:
+              - twap
+          example: twap
+        - name: account_id
+          in: query
+          required: false
+          description: Account ID for public (unauthenticated) queries
+          schema:
+            type: string
+        - name: vault_id
+          in: query
+          required: false
+          description: Vault ID for public vault queries
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  fills:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/FillHistoryEntry'
+                  count:
+                    type: integer
+                    description: Number of fills returned
+                    example: 50
+        '400':
+          $ref: '#/components/responses/InvalidParameter'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /v2/leverage:
+    post:
+      tags:
+        - Trading
+      summary: Update leverage
+      description: >
+        Update the leverage for a specific symbol.
+
+
+        **Note:** This affects new positions only. Existing positions are not
+        modified.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LeverageRequest'
+      responses:
+        '200':
+          description: Leverage updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LeverageResponse'
+          x-gitbook-description-html: <p>Leverage updated</p>
+        '400':
+          $ref: '#/components/responses/InvalidParameter'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+      x-gitbook-description-html: >-
+        <p>Update the leverage for a specific
+        symbol.</p><p><strong>Note:</strong> This affects new positions only.
+        Existing positions are not modified.</p>
+      x-gitbook-description-document:
+        object: document
+        data:
+          schemaVersion: 9
+        nodes:
+          - object: block
+            type: paragraph
+            isVoid: false
+            data: {}
+            nodes:
+              - object: text
+                leaves:
+                  - object: leaf
+                    text: Update the leverage for a specific symbol.
+                    marks: []
+                key: MObU5iWEyDl0
+            key: Bbw0sFkKIvQE
+          - object: block
+            type: paragraph
+            isVoid: false
+            data: {}
+            nodes:
+              - object: text
+                leaves:
+                  - object: leaf
+                    text: 'Note:'
+                    marks:
+                      - object: mark
+                        type: bold
+                        data: {}
+                  - object: leaf
+                    text: ' This affects new positions only. Existing positions are not modified.'
+                    marks: []
+                key: sz9JQj8bZWlL
+            key: tckyQi9KRvla
+        key: kdzGLbw8M0s6
+  /v2/marginMode:
+    post:
+      tags:
+        - Trading
+      summary: Update margin mode
+      description: >
+        Switch between cross and isolated margin mode.
+
+
+        **Note:** Cannot change margin mode while a position is open for the
+        symbol.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MarginModeRequest'
+      responses:
+        '200':
+          description: Margin mode updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MarginModeResponse'
+          x-gitbook-description-html: <p>Margin mode updated</p>
+        '400':
+          $ref: '#/components/responses/InvalidParameter'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+      x-gitbook-description-html: >-
+        <p>Switch between cross and isolated margin
+        mode.</p><p><strong>Note:</strong> Cannot change margin mode while a
+        position is open for the symbol.</p>
+      x-gitbook-description-document:
+        object: document
+        data:
+          schemaVersion: 9
+        nodes:
+          - object: block
+            type: paragraph
+            isVoid: false
+            data: {}
+            nodes:
+              - object: text
+                leaves:
+                  - object: leaf
+                    text: Switch between cross and isolated margin mode.
+                    marks: []
+                key: yniKOdGaVLdT
+            key: 1DOWI4XpacmP
+          - object: block
+            type: paragraph
+            isVoid: false
+            data: {}
+            nodes:
+              - object: text
+                leaves:
+                  - object: leaf
+                    text: 'Note:'
+                    marks:
+                      - object: mark
+                        type: bold
+                        data: {}
+                  - object: leaf
+                    text: ' Cannot change margin mode while a position is open for the symbol.'
+                    marks: []
+                key: VXtlLMlndc4C
+            key: ysBELiyxid0N
+        key: FEG5pw8G3mdx
+  /v2/isoMargin:
+    post:
+      tags:
+        - Trading
+      summary: Modify isolated margin
+      description: |
+        Add or remove margin from an isolated position.
+
+        **Requirements:**
+        - Position must exist and be in isolated margin mode
+        - Cannot remove more margin than available
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ModifyMarginRequest'
+      responses:
+        '200':
+          description: Margin modification submitted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModifyMarginResponse'
+          x-gitbook-description-html: <p>Margin modification submitted</p>
+        '400':
+          $ref: '#/components/responses/InvalidParameter'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+      x-gitbook-description-html: >-
+        <p>Add or remove margin from an isolated
+        position.</p><p><strong>Requirements:</strong></p><ul><li>Position must
+        exist and be in isolated margin mode</li><li>Cannot remove more margin
+        than available</li></ul>
+      x-gitbook-description-document:
+        object: document
+        data:
+          schemaVersion: 9
+        nodes:
+          - object: block
+            type: paragraph
+            isVoid: false
+            data: {}
+            nodes:
+              - object: text
+                leaves:
+                  - object: leaf
+                    text: Add or remove margin from an isolated position.
+                    marks: []
+                key: 81AcxpIYM9I7
+            key: H91rG9tQVxJQ
+          - object: block
+            type: paragraph
+            isVoid: false
+            data: {}
+            nodes:
+              - object: text
+                leaves:
+                  - object: leaf
+                    text: 'Requirements:'
+                    marks:
+                      - object: mark
+                        type: bold
+                        data: {}
+                key: eWznk2NFQ0C3
+            key: YqN4rc8K3Jqq
+          - object: block
+            type: list-unordered
+            isVoid: false
+            data: {}
+            nodes:
+              - object: block
+                type: list-item
+                isVoid: false
+                data: {}
+                nodes:
+                  - object: block
+                    type: paragraph
+                    isVoid: false
+                    data: {}
+                    nodes:
+                      - object: text
+                        leaves:
+                          - object: leaf
+                            text: Position must exist and be in isolated margin mode
+                            marks: []
+                        key: lXzu1PSK3fOs
+                    key: 9UHHgNX1jrDe
+                key: WtuVFAGOFGnb
+              - object: block
+                type: list-item
+                isVoid: false
+                data: {}
+                nodes:
+                  - object: block
+                    type: paragraph
+                    isVoid: false
+                    data: {}
+                    nodes:
+                      - object: text
+                        leaves:
+                          - object: leaf
+                            text: Cannot remove more margin than available
+                            marks: []
+                        key: e2Mn73u0yArv
+                    key: huWzwYy8UfUe
+                key: GOstspIcGpEl
+            key: UKbktz51SA71
+        key: rFcG4vhQQP27
