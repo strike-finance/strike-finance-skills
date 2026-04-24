@@ -9,15 +9,27 @@ description: Strike Finance user stream — real-time order fills, account updat
 
 | Property | Value |
 |----------|-------|
-| URL | `wss://v2.strikefinance.org/ws` |
-| Auth | JWT token or API wallet |
+| URL | `wss://api.strikefinance.org/ws/user-api` |
+| Auth | API wallet signing (same headers as REST) |
 
-## Authentication (JWT Method)
+## Authentication (API Wallet Method)
+
+Authenticate using the same Ed25519 API wallet signing used for REST requests.
 
 ```json
-SEND:    {"method": "AUTH", "params": {"token": "<JWT_TOKEN>"}}
+SEND:    {
+  "method": "AUTH",
+  "params": {
+    "public_key": "<ED25519_PUBLIC_KEY_HEX>",
+    "signature": "<ED25519_SIGNATURE_HEX>",
+    "timestamp": "<UNIX_SECONDS>",
+    "nonce": "<UUID_V4>"
+  }
+}
 RECEIVE: {"status": 200, "result": {"account_id": "<ID>", "authenticated": true}}
 ```
+
+The signature message format is the same as REST: `AUTH:ws/user-api:{TIMESTAMP}:{NONCE}:` (empty body hash).
 
 ## Subscription
 
@@ -290,8 +302,9 @@ class StrikeUserStream {
   private positions = new Map<string, PositionUpdate>();
 
   constructor(
-    private jwtToken: string,
-    private url = "wss://v2.strikefinance.org/ws"
+    private publicKey: string,
+    private privateKey: Uint8Array,
+    private url = "wss://api.strikefinance.org/ws/user-api"
   ) {}
 
   connect(): void {
@@ -321,11 +334,23 @@ class StrikeUserStream {
     };
   }
 
-  private authenticate(): void {
+  private async authenticate(): Promise<void> {
+    const timestamp = Math.floor(Date.now() / 1000).toString();
+    const nonce = crypto.randomUUID();
+    const message = `AUTH:ws/user-api:${timestamp}:${nonce}:`;
+    const msgBytes = new TextEncoder().encode(message);
+    const { sign } = await import("@noble/ed25519");
+    const signature = Buffer.from(await sign(msgBytes, this.privateKey)).toString("hex");
+
     this.ws?.send(
       JSON.stringify({
         method: "AUTH",
-        params: { token: this.jwtToken },
+        params: {
+          public_key: this.publicKey,
+          signature,
+          timestamp,
+          nonce,
+        },
       })
     );
   }
@@ -507,7 +532,7 @@ class StrikeUserStream {
 }
 
 // Usage
-const stream = new StrikeUserStream("your-jwt-token-here");
+const stream = new StrikeUserStream("your-public-key-hex", yourPrivateKeyBytes);
 stream.connect();
 stream.setupVisibilityHandler();
 ```

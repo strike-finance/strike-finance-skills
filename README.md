@@ -48,7 +48,7 @@ npx strike-finance-skills install --agents claude cursor codex
 | Testnet | `https://api-v2-testnet.strikefinance.org` |
 | Market Data | `https://api.strikefinance.org/price` |
 | Public WS | `wss://v2.strikefinance.org/ws/stream` |
-| User WS | `wss://v2.strikefinance.org/ws` |
+| User WS | `wss://api.strikefinance.org/ws/user-api` |
 
 ## OpenAPI Specs
 

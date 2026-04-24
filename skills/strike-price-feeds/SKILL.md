@@ -10,8 +10,7 @@ description: Strike Finance real-time price feeds — WebSocket channels for mar
 | Endpoint | URL | Auth |
 |----------|-----|------|
 | Public | `wss://v2.strikefinance.org/ws/stream` | None required |
-| User | `wss://v2.strikefinance.org/ws` | JWT or API wallet auth |
-| Builder | `/ws-api` | API wallet session.logon auth |
+| User | `wss://api.strikefinance.org/ws/user-api` | API wallet signing |
 
 ## Subscription Format
 

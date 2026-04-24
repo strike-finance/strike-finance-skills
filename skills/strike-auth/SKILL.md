@@ -183,21 +183,11 @@ async function authenticatedFetch(
 }
 ```
 
-## JWT Auth Alternative
-
-For browser-based flows, use JWT authentication instead of API wallet signing:
-
-```
-Authorization: Bearer {token}
-```
-
-The JWT token is obtained through the wallet connect flow (non-builder). Include it as a standard Authorization header on all requests.
-
 ## Session Expiry Handling
 
 On receiving a `401 Unauthorized` response:
 
-1. Clear all stored credentials (private key, public key, JWT token)
+1. Clear all stored credentials (private key, public key)
 2. Dispatch a `"strike:session-expired"` custom event on `window`
 3. Redirect the user to re-authenticate
 
