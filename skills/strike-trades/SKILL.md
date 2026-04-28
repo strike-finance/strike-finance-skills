@@ -17,7 +17,7 @@ Returns recent market trades for the given symbol.
 
 ### WebSocket
 
-**URL:** `wss://v2.strikefinance.org/ws/stream` (public, no auth)
+**URL:** `wss://api.strikefinance.org/ws/price` (public, no auth)
 
 #### Subscribe
 
@@ -142,7 +142,7 @@ class TradeManager {
     onUpdate([...this.trades]);
 
     // Connect WebSocket for real-time trades
-    this.ws = new WebSocket("wss://v2.strikefinance.org/ws/stream");
+    this.ws = new WebSocket("wss://api.strikefinance.org/ws/price");
 
     this.ws.onopen = () => {
       this.ws!.send(JSON.stringify({

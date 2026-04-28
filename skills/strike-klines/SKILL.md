@@ -49,7 +49,7 @@ GET https://api.strikefinance.org/price/v2/klines?symbol=BTC-USD&interval=15m&li
 
 ## WebSocket (Last Price Klines)
 
-**URL:** `wss://v2.strikefinance.org/ws/stream`
+**URL:** `wss://api.strikefinance.org/ws/price`
 
 Only **last price** klines are available via the WebSocket kline channel. Mark and index price klines must be constructed client-side (see below).
 
@@ -326,7 +326,7 @@ class StrikeDatafeed {
   }
 
   private subscribeLastPriceKlines(apiInterval: string): void {
-    this.ws = new WebSocket("wss://v2.strikefinance.org/ws/stream");
+    this.ws = new WebSocket("wss://api.strikefinance.org/ws/price");
 
     this.ws.onopen = () => {
       this.ws!.send(JSON.stringify({
@@ -387,7 +387,7 @@ class StrikeDatafeed {
   }
 
   private subscribeMarkPriceUpdates(intervalMs: number): void {
-    this.ws = new WebSocket("wss://v2.strikefinance.org/ws/stream");
+    this.ws = new WebSocket("wss://api.strikefinance.org/ws/price");
 
     this.ws.onopen = () => {
       this.ws!.send(JSON.stringify({

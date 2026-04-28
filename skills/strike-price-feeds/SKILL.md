@@ -9,7 +9,7 @@ description: Strike Finance real-time price feeds — WebSocket channels for mar
 
 | Endpoint | URL | Auth |
 |----------|-----|------|
-| Public | `wss://v2.strikefinance.org/ws/stream` | None required |
+| Public | `wss://api.strikefinance.org/ws/price` | None required |
 | User | `wss://api.strikefinance.org/ws/user-api` | API wallet signing |
 
 ## Subscription Format
@@ -165,7 +165,7 @@ class StrikePriceFeed {
   private reconnectAttempt = 0;
   private maxReconnectDelay = 30000;
 
-  constructor(private url = "wss://v2.strikefinance.org/ws/stream") {}
+  constructor(private url = "wss://api.strikefinance.org/ws/price") {}
 
   connect(): void {
     this.ws = new WebSocket(this.url);

@@ -28,7 +28,7 @@ interface DepthSnapshot {
 
 ## WebSocket
 
-**URL:** `wss://v2.strikefinance.org/ws/stream` (public, no auth)
+**URL:** `wss://api.strikefinance.org/ws/price` (public, no auth)
 
 ### Subscribe
 
@@ -130,7 +130,7 @@ class OrderBookManager {
     this.updateCallback = onUpdate;
 
     // Step 1: Connect WebSocket
-    this.ws = new WebSocket("wss://v2.strikefinance.org/ws/stream");
+    this.ws = new WebSocket("wss://api.strikefinance.org/ws/price");
 
     this.ws.onopen = () => {
       this.ws!.send(JSON.stringify({
