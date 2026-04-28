@@ -1,10 +1,10 @@
 {
   "name": "strike-finance-skills",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "AI coding assistant skills for Strike Finance integration — trading bots, builder APIs, and real-time market data",
   "type": "module",
   "bin": {
-    "strike-finance-skills": "./dist/cli.js"
+    "strike-finance-skills": "dist/cli.js"
   },
   "files": [
     "dist"
