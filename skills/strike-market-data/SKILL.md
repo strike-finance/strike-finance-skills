@@ -11,6 +11,126 @@ All endpoints are PUBLIC -- no authentication required.
 
 ---
 
+## WebSocket
+
+Real-time market streams are also PUBLIC -- no authentication required.
+
+| Environment | URL |
+|-------------|-----|
+| Mainnet | `wss://api.strikefinance.org/ws/price` |
+| Testnet | `wss://api-v2-testnet.strikefinance.org/ws/price` |
+
+Subscribe:
+
+```json
+{
+  "method": "subscribe",
+  "channel": "depth",
+  "symbol": "BTC-USD",
+  "id": 1
+}
+```
+
+Unsubscribe:
+
+```json
+{
+  "method": "unsubscribe",
+  "channel": "depth",
+  "symbol": "BTC-USD",
+  "id": 2
+}
+```
+
+Success response:
+
+```json
+{ "result": null, "id": 1 }
+```
+
+Client keep-alive:
+
+```json
+{ "method": "ping", "id": 99 }
+```
+
+Server replies:
+
+```json
+{ "method": "pong", "id": 99 }
+```
+
+Server WebSocket ping frames are sent every 54 seconds; connections close if no pong is received within 60 seconds. Most WebSocket libraries answer protocol-level pings automatically.
+
+### WebSocket Channels
+
+| Channel | Symbol Required | Frequency | Description |
+|---------|-----------------|-----------|-------------|
+| `markprice` | Yes | 3 seconds | Mark price, index price, funding rate |
+| `!markprice@arr` | No | 3 seconds | Mark prices for all symbols |
+| `kline_{interval}` | Yes | Real-time | Candlestick stream |
+| `miniticker` | Yes | 1 second | 24h mini ticker for one symbol |
+| `!miniticker@arr` | No | 1 second | 24h mini tickers for all symbols |
+| `depth` | Yes | Real-time | Order book deltas |
+| `trade` | Yes | Real-time | Public trade stream |
+
+Available kline intervals: `1m`, `3m`, `5m`, `15m`, `30m`, `1h`, `2h`, `4h`, `6h`, `8h`, `12h`, `1d`, `3d`, `1w`, `1M`.
+
+### WebSocket Event Shapes
+
+Depth deltas:
+
+```json
+{
+  "e": "depthUpdate",
+  "E": 1704067200000,
+  "s": "BTC-USD",
+  "U": 128742991,
+  "u": 128742991,
+  "b": [["94249.50", "2.5"], ["94247.00", "0"]],
+  "a": [["94251.00", "1.8"]]
+}
+```
+
+- `U` and `u` are uint64 engine sequence IDs; parse as `BigInt` in JavaScript/TypeScript.
+- `U`/`u` are globally monotonic, not per-symbol contiguous. Do not treat gaps as missed updates.
+- Quantity `"0"` removes the price level.
+- To maintain a local order book: fetch `GET /price/v2/depth?symbol=BTC-USD&limit=1000`, subscribe to `depth`, buffer events while the snapshot loads, drop events with `u <= lastUpdateId`, then apply later deltas and set `lastUpdateId = u`.
+
+Mark price:
+
+```json
+{
+  "e": "markPriceUpdate",
+  "E": 1704067200000,
+  "s": "BTC-USD",
+  "p": "94250.50",
+  "i": "94248.00",
+  "P": "0",
+  "r": "0.0001",
+  "T": 1704070800000
+}
+```
+
+Trade:
+
+```json
+{
+  "e": "trade",
+  "E": 1704067200000,
+  "s": "BTC-USD",
+  "t": 123456789,
+  "p": "94250.50",
+  "q": "0.5",
+  "T": 1704067200000,
+  "m": false
+}
+```
+
+Kline events use channel `kline_{interval}` and return `e: "kline"` with nested `k` fields (`t`, `T`, `s`, `i`, `o`, `c`, `h`, `l`, `v`, `n`, `x`, `q`, `V`, `Q`). Mini ticker events use `e: "24hrMiniTicker"` and fields `c`, `o`, `h`, `l`, `v`, `q`.
+
+---
+
 ## Endpoints
 
 ### GET /v2/depth -- Orderbook Depth
@@ -110,4 +230,4 @@ Query params:
 
 - **BigInt required**: `lastUpdateId` in depth responses can exceed `Number.MAX_SAFE_INTEGER`. Always parse with `BigInt`.
 - **Caching**: Depth endpoint is cached for 5 seconds server-side. Use the `X-Cache` response header to detect `HIT` vs `MISS`.
-- **Real-time data**: For streaming updates, combine REST polling with WebSocket subscriptions (see `strike-orderbook` and `strike-price-feeds` skills).
+- **Real-time data**: Prefer the public market WebSocket for live updates and REST for snapshots/backfill.

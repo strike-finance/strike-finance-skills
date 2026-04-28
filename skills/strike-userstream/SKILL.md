@@ -7,38 +7,59 @@ description: Strike Finance user stream — real-time order fills, account updat
 
 ## Connection
 
-| Property | Value |
-|----------|-------|
-| URL | `wss://api.strikefinance.org/ws/user-api` |
-| Auth | API wallet signing (same headers as REST) |
+| Environment | URL |
+|-------------|-----|
+| Mainnet | `wss://api.strikefinance.org/ws/user-api` |
+| Testnet | `wss://api-v2-testnet.strikefinance.org/ws/user-api` |
+
+- User account streams require WebSocket authentication before subscribing.
+- Vault account streams are public; subscribe with `vault_id` or the vault account `account_id` without authentication.
+- The server sends WebSocket ping frames every 54 seconds and disconnects if no pong is received within 60 seconds.
+- The server may batch multiple JSON events in one text frame separated by newline characters. Always split each frame on `\n` and parse each JSON object separately.
+- Numeric values are strings to preserve decimal precision; timestamps are Unix milliseconds.
 
 ## Authentication (API Wallet Method)
 
-Authenticate using the same Ed25519 API wallet signing used for REST requests.
+Authenticate with `session.logon` after opening the WebSocket. This is not the REST header/nonce format and does not use the old `AUTH` method.
+
+Sign the ASCII payload `apiKey=<PUBLIC_KEY_HEX>&timestamp=<TIMESTAMP_MS>` with the API wallet Ed25519 private key. The `timestamp` value is Unix milliseconds.
 
 ```json
 SEND:    {
-  "method": "AUTH",
+  "method": "session.logon",
   "params": {
-    "public_key": "<ED25519_PUBLIC_KEY_HEX>",
+    "apiKey": "<PUBLIC_KEY_HEX>",
     "signature": "<ED25519_SIGNATURE_HEX>",
-    "timestamp": "<UNIX_SECONDS>",
-    "nonce": "<UUID_V4>"
-  }
+    "timestamp": 1705000000000
+  },
+  "id": 1
 }
-RECEIVE: {"status": 200, "result": {"account_id": "<ID>", "authenticated": true}}
+RECEIVE: {"id": 1, "status": 200, "result": {"authenticated": true, "account_id": "<ID>"}}
 ```
 
-The signature message format is the same as REST: `AUTH:ws/user-api:{TIMESTAMP}:{NONCE}:` (empty body hash).
+Do not include a nonce, body hash, REST path, or REST auth headers in the WebSocket logon message.
 
 ## Subscription
 
 ```json
-SEND:    {"method": "subscribe", "channel": "userstream", "account_id": "<ID>", "id": "1"}
-RECEIVE: {"id": "1", "result": null}
+SEND:    {"method": "subscribe", "channel": "userstream", "account_id": "<ID>", "id": 1}
+RECEIVE: {"id": 1, "result": null}
 ```
 
 For vaults, use `vault_id` instead of `account_id` (no auth needed).
+
+## Message Envelope
+
+Most events use this outer envelope:
+
+```json
+{
+  "e": "<EVENT_TYPE>",
+  "E": 1705000000000,
+  "s": "BTC-USDT",
+  "data": { "...": "payload varies by event type" }
+}
+```
 
 ## Event Types
 
@@ -91,7 +112,7 @@ Received for every order state change and fill.
 | `f` | Time in force: `GTC`, `FOK`, `IOC` |
 | `q` | Original quantity |
 | `p` | Original price |
-| `X` | Status: `NEW`, `PARTIALLY_FILLED`, `FILLED`, `CANCELED`, `REJECTED`, `EXPIRED` |
+| `X` | Status: `NEW`, `OPEN`, `PARTIALLY_FILLED`, `FILLED`, `CANCELED`, `REJECTED`, `EXPIRED` |
 | `x` | Execution type: `NEW`, `CANCELED`, `REJECTED`, `TRADE`, `EXPIRED` |
 | `i` | Order ID |
 | `z` | Cumulative filled quantity |
@@ -124,23 +145,27 @@ Received on balance or position changes.
 {
   "e": "ACCOUNT_UPDATE",
   "E": 1234567890000,
-  "T": 1234567890000,
-  "r": "DEPOSIT",
-  "B": [{
-    "a": "USD",
-    "wb": "10000.00",
-    "cw": "9500.00",
-    "bc": "500.00"
-  }],
-  "P": [{
-    "s": "BTC-USD",
-    "pa": "1.5",
-    "ep": "42000.00",
-    "mt": "cross",
-    "ib": "0",
-    "ps": "LONG",
-    "i": "pos-123"
-  }]
+  "data": {
+    "e": "ORDER",
+    "B": [{
+      "a": "USDT",
+      "wb": "10000.00",
+      "cw": "9500.00",
+      "bc": "500.00"
+    }],
+    "P": [{
+      "s": "BTC-USDT",
+      "pa": "1.5",
+      "ep": "42000.00",
+      "mt": "cross",
+      "ib": "0",
+      "ps": "LONG",
+      "i": 12345
+    }],
+    "r": "FILL",
+    "E": 1234567890000,
+    "T": 1234567890000
+  }
 }
 ```
 
@@ -154,27 +179,37 @@ Received on balance or position changes.
 | `B[].cw` | Cross wallet balance |
 | `B[].bc` | Balance change |
 | `P[].s` | Symbol |
-| `P[].pa` | Position amount (absolute value) |
+| `P[].pa` | Position amount: positive long, negative short, `"0"` closed |
 | `P[].ep` | Entry price |
 | `P[].mt` | Margin type: `cross` or `isolated` |
 | `P[].ib` | Isolated balance (only for isolated) |
-| `P[].ps` | Position side: `LONG` or `SHORT` |
+| `P[].ps` | Position side: `LONG`, `SHORT`, or `BOTH` |
 | `P[].i` | Position ID (optional) |
 
-### STRATEGYUPDATE
+If `data.event_type` exists, the `ACCOUNT_UPDATE` is a vault event or transaction status update. Inspect `data.event_type` and `data.event_data` instead of expecting `B`/`P` arrays.
+
+### strategyUpdate
 
 Received when TWAP/bracket strategy status changes.
 
 ```json
 {
-  "e": "STRATEGYUPDATE",
+  "e": "strategyUpdate",
+  "E": 1705000000000,
+  "s": "BTC-USDT",
   "data": {
+    "account_id": "account-123",
     "strategy_id": "twap-123",
-    "market": "BTC-USD",
+    "market": "BTC-USDT",
     "status": "completed",
+    "side": "BUY",
     "filled_size": "1.0",
     "total_size": "1.0",
-    "last_error": null
+    "duration_sec": 3600,
+    "slices_fired": 24,
+    "nominal_slices": 24,
+    "last_error": "",
+    "completed_at_ms": 1705000000000
   }
 }
 ```
@@ -214,8 +249,8 @@ Received when TWAP/bracket strategy status changes.
 ## TypeScript Example
 
 ```typescript
-type OrderStatus = "NEW" | "PARTIALLY_FILLED" | "FILLED" | "CANCELED" | "CANCELLED" | "REJECTED" | "EXPIRED";
-type PositionSide = "LONG" | "SHORT";
+type OrderStatus = "NEW" | "OPEN" | "PARTIALLY_FILLED" | "FILLED" | "CANCELED" | "CANCELLED" | "REJECTED" | "EXPIRED";
+type PositionSide = "LONG" | "SHORT" | "BOTH";
 type Side = "BUY" | "SELL";
 
 interface OrderTradeUpdate {
@@ -265,21 +300,29 @@ interface PositionUpdate {
 }
 
 interface AccountUpdate {
-  e: "ACCOUNT_UPDATE";
+  e: string;
   E: number;
   T: number;
   r: string;
-  B: BalanceUpdate[];
-  P: PositionUpdate[];
+  B?: BalanceUpdate[];
+  P?: PositionUpdate[];
+  event_type?: string;
+  event_data?: Record<string, unknown>;
 }
 
 interface StrategyUpdate {
+  account_id: string;
   strategy_id: string;
   market: string;
   status: "completed" | "expired" | "cancelled" | "failed" | "liquidated";
+  side: Side;
   filled_size: string;
   total_size: string;
-  last_error: string | null;
+  duration_sec: number;
+  slices_fired: number;
+  nominal_slices: number;
+  last_error: string;
+  completed_at_ms: number;
 }
 
 const FINAL_STATUSES: Set<string> = new Set([
@@ -317,8 +360,11 @@ class StrikeUserStream {
     };
 
     this.ws.onmessage = (event) => {
-      const data = JSON.parse(event.data);
-      this.handleMessage(data);
+      for (const raw of String(event.data).split("\n")) {
+        const message = raw.trim();
+        if (!message) continue;
+        this.handleMessage(JSON.parse(message));
+      }
     };
 
     this.ws.onclose = (event) => {
@@ -335,22 +381,21 @@ class StrikeUserStream {
   }
 
   private async authenticate(): Promise<void> {
-    const timestamp = Math.floor(Date.now() / 1000).toString();
-    const nonce = crypto.randomUUID();
-    const message = `AUTH:ws/user-api:${timestamp}:${nonce}:`;
+    const timestamp = Date.now();
+    const message = `apiKey=${this.publicKey}&timestamp=${timestamp}`;
     const msgBytes = new TextEncoder().encode(message);
     const { sign } = await import("@noble/ed25519");
     const signature = Buffer.from(await sign(msgBytes, this.privateKey)).toString("hex");
 
     this.ws?.send(
       JSON.stringify({
-        method: "AUTH",
+        method: "session.logon",
         params: {
-          public_key: this.publicKey,
+          apiKey: this.publicKey,
           signature,
           timestamp,
-          nonce,
         },
+        id: 1,
       })
     );
   }
@@ -382,9 +427,9 @@ class StrikeUserStream {
         this.handleOrderTradeUpdate(data.data as OrderTradeUpdate);
         break;
       case "ACCOUNT_UPDATE":
-        this.handleAccountUpdate(data as unknown as AccountUpdate);
+        this.handleAccountUpdate(data.data as AccountUpdate);
         break;
-      case "STRATEGYUPDATE":
+      case "strategyUpdate":
         this.handleStrategyUpdate(data.data as StrategyUpdate);
         break;
     }
@@ -445,17 +490,22 @@ class StrikeUserStream {
   }
 
   private handleAccountUpdate(update: AccountUpdate): void {
+    if (update.event_type) {
+      console.log(`Vault/account event: ${update.event_type}`);
+      return;
+    }
+
     console.log(`Account update (${update.r}):`);
 
     // Process balance changes
-    for (const balance of update.B) {
+    for (const balance of update.B ?? []) {
       console.log(
         `  Balance ${balance.a}: ${balance.wb} (change: ${balance.bc})`
       );
     }
 
     // Process position changes
-    for (const pos of update.P) {
+    for (const pos of update.P ?? []) {
       const key = `${pos.s}-${pos.ps}`;
       const size = Math.abs(parseFloat(pos.pa));
 
