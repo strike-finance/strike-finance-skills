@@ -1,25 +1,65 @@
 openapi: 3.0.3
 info:
   title: Strike Perpetuals - Trade REST API
-  description: Order management endpoints for Strike Perpetuals trading platform.
-  version: 2.1.0
+  description: |
+    Order entry, order reads, bracket (TP/SL) strategies, TWAP, leverage and margin endpoints
+    of the Strike Perpetuals API service.
+
+    **Asynchronous execution.** Every write is sequenced to the matching engine and answered
+    before the engine processes it. A `201`/`200` here means "accepted and sequenced", not
+    "filled" or "resting": order creates return `status: "pending"` (TWAP create returns the
+    strategy's `status: "active"`; `PUT /v2/symbols` returns `204`). Engine-side rejections
+    (margin, tick/step size, post-only cross, reduce-only, ...) arrive on the user stream
+    (`wss://<host>/ws/user-api`, see the `strike-userstream` skill) as order updates with
+    status `rejected`/`expired`/`canceled` and a reason code in `CloseReason`.
+
+    **Silently dropped commands.** Some engine rejects happen before an order event exists:
+    the API still answers `201`/`200`, but no user-stream update follows and `GET /v2/order`
+    returns `404`. On `POST /v2/order` and `/v2/orders/batch` items: unknown `symbol`, bad
+    `slippage` (`slippage_must_be_positive` / `slippage_only_for_market_orders`), market not
+    open (`order_not_allowed`), trading halted (`circuit_breaker`), and - batch items only - a
+    missing `side`/`type`. On `/v2/order/strategy`: unknown symbol, `order_not_allowed`, a
+    reused `strategy_id`. On the replace endpoints an unknown symbol or a create with missing `side`/
+    `type` drops the whole command; bad `slippage` is a synchronous `400` there. Margin-mode
+    changes (`POST /v2/marginMode`, `PUT /v2/symbols`) that the engine refuses are also dropped
+    without an event - confirm with `GET /v2/symbols`.
+
+    **Errors.** HTTP errors are always a JSON object with an `error` string; a few add extra
+    fields (`failed_index`, `max_leverage`/`requested`). Malformed bodies return the Go/gin
+    binding text, e.g. `Key: 'CreateOrderRequest.Side' Error:Field validation for 'Side' failed
+    on the 'required' tag`. `required` is not enforced at bind time on decimal fields (`size`,
+    `amount`, leg `stop_price`) or on items inside arrays (`orders[]`, `replacements[]`): a
+    missing `size` reaches the engine and is rejected as `order_less_than_min_size`, a missing
+    `side`/`type` in an array item is dropped as above. Send enum and decimal fields only when you have a value: an empty
+    string (`"time_in_force": ""`, `"price": ""`) fails JSON decoding with `400`. Unknown
+    fields are ignored silently.
+
+    **Market rules** (tick, step, min/max size, min notional, price bounds) are the fields of
+    `GET /v2/markets` on this host; the engine validates orders against them.
+
+    **Decimals** (sizes, prices, rates) are serialized as JSON strings in responses; requests
+    accept either a string or a JSON number.
+
+    Order history (`/v2/history/order`) and fill history (`/v2/history/fill`) are documented in
+    `user-api.yaml`.
+  version: 2.2.0
   contact:
     name: Strike Finance
     url: https://www.strikefinance.org
 servers:
 - url: https://api.strikefinance.org
-  description: Mainnet
+  description: Mainnet (API service; paths below are used as-is, no /price prefix)
 - url: https://api-v2-testnet.strikefinance.org
   description: Testnet
 tags:
-- name: Algo
-  description: Algorithmic trading strategies (TWAP)
 - name: Orders
-  description: Order management (create, cancel, query)
+  description: Create, cancel, replace and query orders
+- name: Strategy
+  description: Bracket orders (primary order + take-profit / stop-loss legs)
+- name: Algo
+  description: Server-side TWAP strategies
 - name: Trading
-  description: Leverage, margin mode, and isolated margin operations
-- name: History
-  description: Order and fill history queries
+  description: Leverage, margin mode and isolated margin
 security:
 - ApiWalletAuth: []
 components:
@@ -29,33 +69,184 @@ components:
       in: header
       name: X-API-Wallet-Public-Key
       description: |
-        Ed25519 signature-based authentication using API Wallets.
+        Ed25519 API wallet signature authentication (the same routes also accept a Strike app JWT;
+        integrators use API wallets). See the `strike-auth` skill for key setup.
 
-        **Required Headers:**
-        - `X-API-Wallet-Public-Key`: Your Ed25519 public key (64 hex characters)
-        - `X-API-Wallet-Signature`: Ed25519 signature of the message (128 hex characters)
-        - `X-API-Wallet-Timestamp`: Unix timestamp in seconds
-        - `X-API-Wallet-Nonce`: Unique UUID v4 per request
+        Required headers on every authenticated request:
+        - `X-API-Wallet-Public-Key`: Ed25519 public key, 64 hex characters
+        - `X-API-Wallet-Signature`: hex Ed25519 signature of the message below
+        - `X-API-Wallet-Timestamp`: Unix seconds; rejected if older than 3 minutes or in the future
+          (sync with `GET /v2/time`, which returns `{"serverTime": <ms>}`)
+        - `X-API-Wallet-Nonce`: 16-128 characters (a UUID works), single use per key
 
-        **Signature Message Format:**
+        Signed message:
         ```
         {METHOD}:{PATH}:{TIMESTAMP}:{NONCE}:{BODY_HASH}
         ```
+        `PATH` is the URL path plus `?` and the raw query string when one is present
+        (e.g. `/v2/openOrders?symbol=BTC-USD`). `BODY_HASH` is the hex SHA-256 of the exact body
+        bytes sent; for an empty body it is SHA-256 of the empty string
+        (`e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`).
+
+        API wallets bound to a sub-account act as that sub-account. Write routes called with
+        neither API wallet headers nor a JWT return `401 {"error":"missing authorization header"}`.
+        Rate limiting is per API wallet key (per IP without one): `429 {"error":"rate limit exceeded"}`.
+  parameters:
+    BuilderFeeBps:
+      name: X-Builder-Fee-Bps
+      in: header
+      required: false
+      description: |
+        Per-order builder fee in basis points (integer, 0-100 by default; 100 = 1% of fill notional).
+        Only used when the authenticating API wallet carries a builder code. It must be <= the
+        builder's registered `fee_share_bps` and <= the account's approved max for that builder.
+        For builder-code wallets the builder must also be active and approved by the account even
+        when the header is omitted (omitted = 0 bps, fills still attributed to the builder).
+        Violations return `400` and nothing is published. The approval is looked up on the calling
+        account, or on `sub_account_id` when one is sent - never on a vault. Builder connect only
+        approves the wallet's own (master) account, so a builder-code wallet that sends
+        `sub_account_id` gets `400 account has not approved builder "<code>"` unless that
+        sub-account approved the builder. Applied on `POST /v2/order`, `/v2/orders/batch`,
+        `/v2/orders/replace`, `/v2/order/replace-batch` and `/v2/order/strategy` (all legs).
+        `POST /v2/order/replace` ignores it: the replacement order carries no builder code at all
+        (no builder fee, no builder attribution).
+      schema:
+        type: integer
+        minimum: 0
+        maximum: 100
+      example: 10
+    AccountIdQuery:
+      name: account_id
+      in: query
+      required: false
+      description: Public read of another account (UUID). No authentication needed.
+      schema:
+        type: string
+        format: uuid
+    VaultIdQuery:
+      name: vault_id
+      in: query
+      required: false
+      description: Read a vault's trading account (public). For writes, `vault_id` lets the vault leader act on the vault.
+      schema:
+        type: string
+    BlockchainQuery:
+      name: blockchain
+      in: query
+      required: false
+      description: Chain for `blockchain_address` (e.g. `solana`, `ethereum`, `cardano`). Optional; inferred when omitted.
+      schema:
+        type: string
+    BlockchainAddressQuery:
+      name: blockchain_address
+      in: query
+      required: false
+      description: Public read by linked wallet address.
+      schema:
+        type: string
+    SubAccountIdQuery:
+      name: sub_account_id
+      in: query
+      required: false
+      description: Authenticated master callers only - act on/read an owned, active sub-account. Mutually exclusive with `vault_id`.
+      schema:
+        type: string
+    LeaderVaultIdQuery:
+      name: vault_id
+      in: query
+      required: false
+      description: Vault leader only - read the vault's account (`403` for non-leaders, `404 vault not found`). Mutually exclusive with `sub_account_id`.
+      schema:
+        type: string
+    SymbolPath:
+      name: symbol
+      in: query
+      required: true
+      description: Market symbol
+      schema:
+        type: string
+      example: BTC-USD
   schemas:
     Error:
       type: object
+      required:
+      - error
       properties:
         error:
           type: string
-          description: Error message
-        code:
-          type: string
-          description: Error code
-        msg:
-          type: string
-          description: Error message (alternative format)
+          description: Human-readable error message or engine reason code
+          example: symbol parameter is required
+    BatchValidationError:
+      type: object
       required:
       - error
+      - failed_index
+      properties:
+        error:
+          type: string
+          example: mismatched_order_symbol
+        failed_index:
+          type: integer
+          description: Index in `replacements` that failed per-item validation (missing legs, vault_id mismatch, `order_id_not_set`, symbol errors). Only `POST /v2/order/replace-batch` adds it. Nothing was published.
+          example: 1
+    LeverageTooHighError:
+      type: object
+      required:
+      - error
+      - max_leverage
+      - requested
+      properties:
+        error:
+          type: string
+          example: leverage exceeds maximum allowed
+        max_leverage:
+          type: integer
+          example: 50
+        requested:
+          type: integer
+          example: 100
+    OrderSide:
+      type: string
+      enum:
+      - buy
+      - sell
+    OrderType:
+      type: string
+      enum:
+      - limit
+      - market
+      - stop
+      - stop_limit
+      - take_profit
+      - take_profit_limit
+      - trailing_stop_market
+    TimeInForce:
+      type: string
+      enum:
+      - GTC
+      - IOC
+      - FOK
+      description: Case-sensitive. Omitted = `GTC`.
+    WorkingType:
+      type: string
+      enum:
+      - mark_price
+      - contract_price
+      description: Price that triggers a conditional order. `contract_price` = last trade price.
+    OrderStatus:
+      type: string
+      enum:
+      - pending
+      - open
+      - filled
+      - canceled
+      - untriggered
+      - rejected
+      - expired
+      description: |
+        `pending` = sequenced, not yet processed by the engine; `open` = resting (may be partially
+        filled); `untriggered` = conditional order waiting for its trigger; `expired` = IOC/FOK
+        remainder, OCO leg, or a resting maker removed by self-trade prevention.
     CreateOrderRequest:
       type: object
       required:
@@ -66,305 +257,404 @@ components:
       properties:
         client_order_id:
           type: string
-          description: Client-provided order ID for tracking
+          maxLength: 256
+          description: |
+            Your ID for the order. Omitted = server generates a UUIDv7. Must not start with a
+            reserved prefix (`copy:`, `liq_`, `bankrupt_`, `adl_`, `if_transfer_`, `if_adl_`,
+            `vault_wd_`). Uniqueness is not enforced for single creates (it is within one
+            replace batch); reuse makes client-ID lookups ambiguous.
           example: my-order-001
         symbol:
           type: string
-          description: Trading pair symbol
           example: BTC-USD
         side:
-          type: string
-          enum:
-          - buy
-          - sell
-          description: Order side
-          example: buy
+          $ref: '#/components/schemas/OrderSide'
         type:
-          type: string
-          enum:
-          - limit
-          - market
-          - stop
-          - stop_limit
-          - take_profit
-          - take_profit_limit
-          - trailing_stop_market
-          description: Order type
-          example: limit
+          $ref: '#/components/schemas/OrderType'
         size:
           type: string
-          description: Order size in base asset
+          description: |
+            Required (see the binding note above). Size in base asset. Minimum is always
+            `order_market_min_size` for every type, skipped only with `close_position` (reduce-only
+            does not skip it). Max size and step: `order_limit_max_size` / `order_limit_step_size`
+            for `limit`, `stop_limit`, `take_profit_limit`; `order_market_max_size` /
+            `order_market_step_size` for `market`, `stop`, `take_profit`, `trailing_stop_market`.
+            A max size of 0 rejects every order of that family (it is not "no limit").
           example: '0.1'
         price:
           type: string
-          description: Order price (required for limit orders)
-          example: '50000.00'
+          description: Limit price for `limit`; the post-trigger limit price for `stop_limit` / `take_profit_limit`. Ignored for market-executing types.
+          example: '50000'
         stop_price:
           type: string
-          description: Trigger price for conditional orders
-          example: '49500.00'
+          description: Trigger price, required (> 0) for `stop`, `stop_limit`, `take_profit`, `take_profit_limit`. Not used by `trailing_stop_market`.
+          example: '48000'
         time_in_force:
-          type: string
-          enum:
-          - GTC
-          - IOC
-          - FOK
-          default: GTC
-          description: |
-            Time in force:
-            - GTC: Good Till Cancel
-            - IOC: Immediate Or Cancel
-            - FOK: Fill Or Kill
-          example: GTC
+          $ref: '#/components/schemas/TimeInForce'
         working_type:
-          type: string
-          enum:
-          - mark_price
-          - contract_price
-          default: mark_price
-          description: Price type for trigger evaluation
+          $ref: '#/components/schemas/WorkingType'
         post_only:
           type: boolean
           default: false
-          description: If true, order will only be maker
+          description: Reject (`order_would_match_immediately`) instead of taking liquidity.
         reduce_only:
           type: boolean
           default: false
-          description: If true, order can only reduce position
+          description: Only reduce the current position. Required `true` for `trailing_stop_market`.
         close_position:
           type: boolean
           default: false
-          description: If true, closes entire position when triggered
+          description: Size the order to the whole position when it executes (implies reduce-only; skips min-size checks). Not supported for `trailing_stop_market`.
         price_protect:
           type: boolean
           default: false
-          description: If true, enables price protection
-        vault_id:
-          type: string
-          description: Optional vault ID to trade on behalf of a vault (leader only)
-          example: vault-abc-123
+          description: Conditional orders do not trigger while the market's last/mark deviation exceeds its `trigger_protect` threshold.
         callback_rate:
           type: string
-          description: 'Trail distance as a percentage for trailing_stop_market orders. Range: "0.1" to
-            "5". E.g. "1" = 1%.'
-          example: '5'
+          description: '`trailing_stop_market` only (required). Trail distance in percent, "0.1" to "5" ("1" = 1%).'
+          example: '1'
         activation_price:
           type: string
-          description: Price at which trailing begins. Only for trailing_stop_market orders. If omitted,
-            trailing activates immediately at current working price.
+          description: '`trailing_stop_market` only. Price at which trailing starts; must not already be crossed (sell: above, buy: below the working price). Omitted = trail starts immediately at the current working price.'
           example: '67000'
         slippage:
           type: string
-          description: Slippage tolerance as a decimal fraction. Only for MARKET orders. E.g. "0.05" =
-            5%. Clamped to the market's maximum price bound. If omitted, the market default bound is used.
-          example: '0.05'
+          description: '`market` only. Max slippage as a fraction ("0.05" = 5%) from book mid (mark price if the book is one-sided); the tighter of this and the market''s own bound applies. Must be > 0. Unfilled remainder is canceled with reason `market_order_exceeded_slippage`.'
+          example: '0.01'
+        vault_id:
+          type: string
+          description: Trade on a vault's account (caller must be its leader; vault must be `active`). Mutually exclusive with `sub_account_id`.
+        sub_account_id:
+          type: string
+          description: Trade on an owned, active sub-account (master callers). Mutually exclusive with `vault_id`.
     CreateOrderResponse:
       type: object
       properties:
         client_order_id:
           type: string
-          description: Client-provided order ID
-          example: my-order-001
+          description: Your ID, or the generated UUIDv7
+          example: 019a0c2e-7f3a-7c4e-9b1d-2f6e8a1c3b5d
         account_id:
           type: string
-          description: Account ID
-          example: 01234567-89ab-cdef-0123-456789abcdef
+          description: Trading account the order was placed on (vault or sub-account when used)
+          example: 019a0c2e-1111-7000-8000-000000000001
         symbol:
           type: string
-          description: Trading pair symbol
           example: BTC-USD
+        status:
+          type: string
+          enum:
+          - pending
+          description: Always `pending` - the engine has not processed the order yet.
         sequence_id:
           type: integer
           format: int64
-          description: Sequence ID for ordering
-          example: 789012
+          description: Engine sequence number of the command (omitted inside batch-replace results)
+          example: 70804200
         message_id:
           type: string
-          description: Message ID for tracking
-          example: msg_xyz
+          description: Engine stream message ID (omitted inside batch-replace results)
+          example: 1775914565478-1
+    OrderStrategy:
+      type: object
+      properties:
+        ID:
+          type: string
+          description: strategy_id given at creation
+        IsPrimary:
+          type: boolean
+    OrderTrailing:
+      type: object
+      description: Trailing-stop state; stays on the order after it triggers (Type becomes `market`).
+      properties:
+        CallbackRate:
+          type: string
+          example: '1'
+        ActivationPrice:
+          type: string
+          description: Explicit activation price, or the resolved working price when omitted at creation
+          example: '67000'
+        Extreme:
+          type: string
+          description: Best price seen since activation (highest for sell, lowest for buy)
+          example: '70000'
+        Activated:
+          type: boolean
+    OrderBuilder:
+      type: object
+      properties:
+        Code:
+          type: string
+          example: mybuilder
+        FeeBps:
+          type: integer
+          example: 10
     Order:
       type: object
       description: |
-        Order model. Field names are PascalCase in JSON responses.
+        Order as returned by `GET /v2/order` and `GET /v2/openOrders`. Keys are PascalCase (engine
+        model). Optional objects (`Strategy`, `Trailing`, `Builder`) are omitted when unset. Orders
+        served from history (terminal orders on `GET /v2/order`) report `BoundPrice` as `"0"` and
+        omit `Builder` and the STP fields.
       properties:
         ID:
           type: integer
           format: int64
-          description: Order ID
-          example: 123456
+          description: Engine order ID
+          example: 33428500
         ClientOrderID:
           type: string
-          description: Client order ID
           example: my-order-001
+        CopySubscriptionID:
+          type: string
+          description: Copy-trading follower orders only (omitted otherwise)
+        CopyLeadOrderID:
+          type: integer
+          format: int64
+          description: Copy-trading follower orders only (omitted otherwise)
         AccountID:
           type: string
-          description: Account ID
-          example: 01234567-89ab-cdef-0123-456789abcdef
+          example: 019a0c2e-1111-7000-8000-000000000001
         Symbol:
           type: string
-          description: Trading pair
           example: BTC-USD
         Strategy:
-          type: object
-          nullable: true
-          description: Strategy linkage (only present for strategy orders)
-          properties:
-            ID:
-              type: string
-              description: Strategy ID
-            IsPrimary:
-              type: boolean
-              description: Whether this is the primary order in the strategy
+          $ref: '#/components/schemas/OrderStrategy'
         CloseReason:
           type: string
-          description: Explains why the order was closed
+          description: Reason code when rejected/canceled/expired (e.g. `order_would_match_immediately`, `insufficient_balance`, `order_strategy_secondary_oco`, `position_closed`); empty otherwise
           example: ''
         Side:
           type: string
           enum:
           - buy
           - sell
-          - none
-          description: Order side
-          example: buy
         Status:
-          type: string
-          enum:
-          - pending
-          - open
-          - filled
-          - canceled
-          - untriggered
-          - rejected
-          - expired
-          - none
-          description: Order status
-          example: filled
+          $ref: '#/components/schemas/OrderStatus'
         Type:
-          type: string
-          enum:
-          - limit
-          - market
-          - stop
-          - stop_limit
-          - take_profit
-          - take_profit_limit
-          - trailing_stop_market
-          description: Order type
-          example: limit
+          $ref: '#/components/schemas/OrderType'
         OriginType:
           type: string
+          description: Original type of a triggered conditional (`Type` becomes `market` or `limit` on trigger); empty string otherwise
           enum:
-          - limit
-          - market
+          - ''
           - stop
           - stop_limit
           - take_profit
           - take_profit_limit
           - trailing_stop_market
-          description: Original type of a triggered conditional order
-          example: stop_limit
+          example: ''
         AutoCloseType:
           type: string
+          description: Set on system-generated orders; empty string for user orders
           enum:
+          - ''
           - liquidation
           - adl
           - bankrupt
           - if_transfer
-          - ''
-          description: Auto-close type (for liquidation/ADL orders)
+          - vault_withdrawal
+          - slp_transfer
           example: ''
         TimeInForce:
-          type: string
-          enum:
-          - GTC
-          - IOC
-          - FOK
-          description: Time in force
-          example: GTC
+          $ref: '#/components/schemas/TimeInForce'
         WorkingType:
           type: string
+          description: '`none` for non-conditional orders'
           enum:
+          - none
           - mark_price
           - contract_price
-          - none
-          description: Working type for triggers
-          example: mark_price
         Size:
           type: string
-          description: Original order size
           example: '0.1'
         Filled:
           type: string
-          description: Filled quantity
-          example: '0.1'
+          example: '0'
         Price:
           type: string
-          description: Order price
-          example: '50000.00'
+          example: '50000'
         StopPrice:
           type: string
-          description: Stop/trigger price
+          description: Trigger price; for trailing stops the live computed stop
           example: '0'
         BoundPrice:
           type: string
-          description: Bound price for market orders
+          description: Worst execution price for market orders (slippage bound)
           example: '0'
+        Trailing:
+          $ref: '#/components/schemas/OrderTrailing'
         PostOnly:
           type: boolean
-          description: Post-only flag
-          example: false
         ReduceOnly:
           type: boolean
-          description: Reduce-only flag
-          example: false
         ClosePosition:
           type: boolean
-          description: Close position flag
-          example: false
         PriceProtect:
           type: boolean
-          description: Price protection flag
-          example: false
-        CallbackRate:
-          type: string
-          nullable: true
-          description: Trail distance in percent (e.g. "5" = 5%). Null for non-trailing orders.
-          example: '5'
-        ActivationPrice:
-          type: string
-          nullable: true
-          description: Price at which trailing began. If originally omitted, shows the resolved working
-            price. Null for non-trailing orders.
-          example: '67000'
-        TrailingExtreme:
-          type: string
-          nullable: true
-          description: Best price seen since activation (highest for sell, lowest for buy). Updates on
-            each favorable tick. Null for non-trailing orders.
-          example: '70000'
-        TrailingActivated:
-          type: boolean
-          nullable: true
-          description: True if the trailing stop has crossed its activation threshold. Null for non-trailing
-            orders.
-          example: true
         CreateTimestamp:
           type: integer
           format: int64
           description: When the API received the order (ms)
-          example: 1704067200000
+          example: 1775914565478
         EntryTimestamp:
           type: integer
           format: int64
           description: When the engine received the order (ms)
-          example: 1704067200050
+          example: 1775914565480
         EventTimestamp:
           type: integer
           format: int64
-          description: Last event time (ms)
-          example: 1704067200150
+          description: Last update (ms)
+          example: 1775914565480
+        Builder:
+          $ref: '#/components/schemas/OrderBuilder'
+        STPGroup:
+          type: string
+          description: Server-assigned self-trade-prevention group of the API wallet (omitted when empty)
+        STPAccountID:
+          type: string
+          description: Root (master) account used for self-trade prevention when trading a sub-account (omitted when empty)
+    AggregateAccountRef:
+      type: object
+      properties:
+        account_id:
+          type: string
+        name:
+          type: string
+        kind:
+          type: string
+          enum:
+          - master
+          - sub
+    OpenOrdersResponse:
+      type: object
+      properties:
+        orders:
+          type: array
+          description: Orders with status `pending`, `open` or `untriggered`, newest first
+          items:
+            $ref: '#/components/schemas/Order'
+        count:
+          type: integer
+          example: 2
+        accounts:
+          type: array
+          description: Only with `scope=all` - accounts that contributed rows
+          items:
+            $ref: '#/components/schemas/AggregateAccountRef'
     CancelOrderRequest:
+      type: object
+      required:
+      - symbol
+      properties:
+        order_id:
+          type: integer
+          format: int64
+          description: Engine order ID (JSON number). One of `order_id` / `client_order_id` is required.
+          example: 33428500
+        client_order_id:
+          type: string
+          description: Resolved against the account's working orders on `symbol` (newest wins if reused). Takes precedence over `order_id`.
+        symbol:
+          type: string
+          example: BTC-USD
+        vault_id:
+          type: string
+          description: Cancel on a vault (leader only)
+        sub_account_id:
+          type: string
+    CancelOrderResponse:
+      type: object
+      properties:
+        order_id:
+          type: integer
+          format: int64
+          example: 33428500
+        client_order_id:
+          type: string
+          description: Echoed when the cancel used `client_order_id`
+        symbol:
+          type: string
+          example: BTC-USD
+        sequence_id:
+          type: integer
+          format: int64
+          example: 70804201
+        message_id:
+          type: string
+          example: 1775914565490-0
+    CancelAllOrdersRequest:
+      type: object
+      description: Send `{}` to cancel everything; an empty body fails with `400 {"error":"EOF"}`.
+      properties:
+        symbol:
+          type: string
+          description: Limit to one symbol; omitted = all symbols
+          example: BTC-USD
+        vault_id:
+          type: string
+        sub_account_id:
+          type: string
+    CancelAllOrdersResponse:
+      type: object
+      properties:
+        account_id:
+          type: string
+        symbol:
+          type: string
+          description: Omitted when no symbol filter was given
+          example: BTC-USD
+        canceled_count:
+          type: integer
+          description: Always -1 (cancellation is asynchronous; watch the user stream)
+          example: -1
+        sequence_id:
+          type: integer
+          format: int64
+        message_id:
+          type: string
+    CreateBatchOrdersRequest:
+      type: object
+      required:
+      - orders
+      properties:
+        orders:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/CreateOrderRequest'
+        vault_id:
+          type: string
+          description: Applied to every order that has no `vault_id` of its own
+        sub_account_id:
+          type: string
+          description: Applies to the whole batch (falls back to the first order's `sub_account_id`)
+    BatchFailure:
+      type: object
+      properties:
+        index:
+          type: integer
+          example: 1
+        error:
+          type: string
+          example: vault trading is paused
+    CreateBatchOrdersResponse:
+      type: object
+      description: Arrays are `null` (not `[]`) when empty.
+      properties:
+        successful:
+          type: array
+          nullable: true
+          items:
+            $ref: '#/components/schemas/CreateOrderResponse'
+        failed:
+          type: array
+          nullable: true
+          description: Orders rejected before publishing (API-side checks only). Engine rejections arrive on the user stream.
+          items:
+            $ref: '#/components/schemas/BatchFailure'
+    ReplaceCancelLeg:
       type: object
       required:
       - order_id
@@ -373,85 +663,165 @@ components:
         order_id:
           type: integer
           format: int64
-          description: Order ID to cancel
-          example: 123456
+          description: Engine order ID to cancel (client_order_id is not supported here). Unknown or already-closed IDs are skipped silently by the engine.
+          example: 33428500
         symbol:
           type: string
-          description: Trading pair symbol
           example: BTC-USD
+    ReplaceOrderRequest:
+      type: object
+      description: At least one of `cancel` / `new_order`. All legs must use the same symbol.
+      properties:
+        cancel:
+          $ref: '#/components/schemas/ReplaceCancelLeg'
+        new_order:
+          $ref: '#/components/schemas/CreateOrderRequest'
         vault_id:
           type: string
-          description: Optional vault ID to cancel on behalf of a vault (leader only)
-          example: vault-abc-123
-    CancelOrderResponse:
+          description: Put `vault_id` here (top level); a different `vault_id` inside a leg is rejected as a mismatch.
+        sub_account_id:
+          type: string
+    ReplaceCancelResult:
       type: object
       properties:
         order_id:
           type: integer
           format: int64
-          description: Canceled order ID
-          example: 123456
         symbol:
           type: string
-          description: Trading pair symbol
-          example: BTC-USD
+    ReplaceResult:
+      type: object
+      properties:
+        cancel:
+          $ref: '#/components/schemas/ReplaceCancelResult'
+        new_order:
+          $ref: '#/components/schemas/CreateOrderResponse'
+    ReplaceOrderResponse:
+      type: object
+      properties:
+        cancel:
+          $ref: '#/components/schemas/ReplaceCancelResult'
+        new_order:
+          $ref: '#/components/schemas/CreateOrderResponse'
         sequence_id:
           type: integer
           format: int64
-          description: Sequence ID
-          example: 789012
         message_id:
           type: string
-          description: Message ID
-          example: msg_xyz
-    CancelAllOrdersRequest:
+    ReplaceBatchOrdersRequest:
       type: object
+      required:
+      - replacements
       properties:
-        symbol:
-          type: string
-          description: Optional symbol filter. If empty, cancels all orders across all symbols.
-          example: BTC-USD
+        replacements:
+          type: array
+          minItems: 1
+          description: Cancels + creates count toward a limit of 1000 operations per request. Items are not field-validated at bind time.
+          items:
+            $ref: '#/components/schemas/ReplaceOrderRequest'
         vault_id:
           type: string
-          description: Optional vault ID to cancel on behalf of a vault (leader only)
-          example: vault-abc-123
-    CancelAllOrdersResponse:
+          description: Only this request-level `vault_id` selects the vault. An item, `cancel` or `new_order` carrying a different `vault_id` fails with `400 vault_id mismatch at index i` (or `cancel ...` / `new_order ...`).
+        sub_account_id:
+          type: string
+          description: Falls back to `replacements[0]`'s `sub_account_id` (then its `new_order` / `cancel`) when omitted
+    ReplaceBatchOrdersResponse:
       type: object
       properties:
-        account_id:
-          type: string
-          description: Account ID
-          example: 01234567-89ab-cdef-0123-456789abcdef
-        symbol:
-          type: string
-          description: Symbol filter used
-          example: BTC-USD
-        canceled_count:
-          type: integer
-          description: Number of orders canceled (-1 = async, count not available)
-          example: -1
         sequence_id:
           type: integer
           format: int64
-          description: Sequence ID
-          example: 789012
         message_id:
           type: string
-          description: Message ID
-          example: msg_xyz
-    OpenOrdersResponse:
+        results:
+          type: array
+          description: One entry per replacement, in request order
+          items:
+            $ref: '#/components/schemas/ReplaceResult'
+    ReplaceSymbolCreateOrder:
       type: object
+      description: A `CreateOrderRequest` without `symbol`, `vault_id` and `sub_account_id` (they come from the parent).
+      required:
+      - side
+      - type
+      - size
       properties:
+        client_order_id:
+          type: string
+          maxLength: 256
+        side:
+          $ref: '#/components/schemas/OrderSide'
+        type:
+          $ref: '#/components/schemas/OrderType'
+        size:
+          type: string
+        price:
+          type: string
+        stop_price:
+          type: string
+        time_in_force:
+          $ref: '#/components/schemas/TimeInForce'
+        working_type:
+          $ref: '#/components/schemas/WorkingType'
+        post_only:
+          type: boolean
+        reduce_only:
+          type: boolean
+        close_position:
+          type: boolean
+        price_protect:
+          type: boolean
+        callback_rate:
+          type: string
+        activation_price:
+          type: string
+        slippage:
+          type: string
+    ReplaceSymbolOrdersRequest:
+      type: object
+      required:
+      - symbol
+      - orders
+      properties:
+        symbol:
+          type: string
+          example: BTC-USD
         orders:
           type: array
+          minItems: 1
+          description: New orders (max 999 - the cancel-all counts as one of the 1000 operations)
           items:
-            $ref: '#/components/schemas/Order'
-        count:
-          type: integer
-          description: Number of open orders
-          example: 5
-    StrategyOrderDetails:
+            $ref: '#/components/schemas/ReplaceSymbolCreateOrder'
+        vault_id:
+          type: string
+        sub_account_id:
+          type: string
+    ReplaceSymbolOrdersResponse:
       type: object
+      properties:
+        sequence_id:
+          type: integer
+          format: int64
+        message_id:
+          type: string
+        account_id:
+          type: string
+        symbol:
+          type: string
+          example: BTC-USD
+        cancel_all:
+          type: boolean
+          description: Always true
+        new_orders:
+          type: array
+          items:
+            $ref: '#/components/schemas/CreateOrderResponse'
+    StrategyLeg:
+      type: object
+      description: |
+        TP or SL leg. Side is set to the opposite of the primary and `reduce_only` is forced on.
+        `tp_order.type` must be `take_profit` or `take_profit_limit`; `sl_order.type` must be
+        `stop` or `stop_limit`.
       required:
       - type
       - size
@@ -459,8 +829,7 @@ components:
       properties:
         client_order_id:
           type: string
-          description: Client order ID for this leg
-          example: tp-001
+          maxLength: 256
         type:
           type: string
           enum:
@@ -468,43 +837,24 @@ components:
           - take_profit_limit
           - stop
           - stop_limit
-          description: Order type for TP/SL leg
-          example: take_profit
         size:
           type: string
-          description: Order size
           example: '0.1'
         price:
           type: string
-          description: Limit price (for limit types)
-          example: '52000.00'
+          description: Post-trigger limit price for `*_limit` legs
         stop_price:
           type: string
-          description: Trigger price
-          example: '52000.00'
+          description: Trigger price, must be > 0 (`invalid_stop_price` otherwise)
+          example: '55000'
         time_in_force:
-          type: string
-          enum:
-          - GTC
-          - IOC
-          - FOK
-          description: Time in force
-          example: GTC
+          $ref: '#/components/schemas/TimeInForce'
         working_type:
-          type: string
-          enum:
-          - mark_price
-          - contract_price
-          description: Working type
-          example: mark_price
+          $ref: '#/components/schemas/WorkingType'
         post_only:
           type: boolean
-          description: Post-only flag
-          example: false
         price_protect:
           type: boolean
-          description: Price protection
-          example: false
     CreateStrategyOrderRequest:
       type: object
       required:
@@ -516,201 +866,219 @@ components:
       properties:
         strategy_id:
           type: string
-          description: Client-provided strategy ID
-          example: strategy-001
+          description: Your ID linking the primary and its legs
+          example: 019a0c2e-2222-7000-8000-000000000002
         client_order_id:
           type: string
-          description: Client order ID for primary order
-          example: primary-001
+          maxLength: 256
+          description: Primary order client ID (generated when omitted)
         symbol:
           type: string
-          description: Trading pair symbol
           example: BTC-USD
         side:
-          type: string
-          enum:
-          - buy
-          - sell
-          description: Order side
-          example: buy
+          $ref: '#/components/schemas/OrderSide'
         type:
-          type: string
-          enum:
-          - limit
-          - market
-          description: Primary order type
-          example: limit
+          $ref: '#/components/schemas/OrderType'
         size:
           type: string
-          description: Order size
-          example: '0.1'
         price:
           type: string
-          description: Order price (for limit orders)
-          example: '50000.00'
         stop_price:
           type: string
-          description: Trigger price for conditional primary orders
-          example: '49500.00'
+          description: Required when the primary is a conditional type
         time_in_force:
-          type: string
-          enum:
-          - GTC
-          - IOC
-          - FOK
-          description: Time in force
-          example: GTC
+          $ref: '#/components/schemas/TimeInForce'
         working_type:
-          type: string
-          enum:
-          - mark_price
-          - contract_price
-          description: Price type for trigger evaluation
+          $ref: '#/components/schemas/WorkingType'
         post_only:
           type: boolean
-          default: false
-          description: If true, primary order will only be maker
         reduce_only:
           type: boolean
-          default: false
-          description: If true, primary order can only reduce position
         close_position:
           type: boolean
-          default: false
-          description: If true, closes entire position when triggered
         price_protect:
           type: boolean
-          default: false
-          description: If true, enables price protection
         vault_id:
           type: string
-          description: Optional vault ID to trade on behalf of a vault (leader only)
-          example: vault-abc-123
+        sub_account_id:
+          type: string
         tp_order:
-          $ref: '#/components/schemas/StrategyOrderDetails'
-          description: Take-profit order configuration
+          $ref: '#/components/schemas/StrategyLeg'
         sl_order:
-          $ref: '#/components/schemas/StrategyOrderDetails'
-          description: Stop-loss order configuration
+          $ref: '#/components/schemas/StrategyLeg'
     CreateStrategyOrderResponse:
       type: object
       properties:
         strategy_id:
           type: string
-          description: Strategy ID
-          example: strategy-001
         primary_client_order_id:
           type: string
-          description: Primary order client ID
-          example: primary-001
         tp_client_order_id:
           type: string
-          description: Take-profit order client ID
-          example: tp-001
+          description: Omitted when no tp_order
         sl_client_order_id:
           type: string
-          description: Stop-loss order client ID
-          example: sl-001
+          description: Omitted when no sl_order
         account_id:
           type: string
-          description: Account ID
-          example: 01234567-89ab-cdef-0123-456789abcdef
         symbol:
           type: string
-          description: Trading pair
-          example: BTC-USD
         sequence_id:
           type: integer
           format: int64
-          description: Sequence ID
-          example: 789012
         message_id:
           type: string
-          description: Message ID
-          example: msg_xyz
-    CreateBatchOrdersRequest:
+    LeverageRequest:
       type: object
       required:
-      - orders
+      - symbol
+      - leverage
       properties:
-        orders:
-          type: array
-          description: Array of orders to create (minimum 1)
-          minItems: 1
-          items:
-            $ref: '#/components/schemas/CreateOrderRequest'
+        symbol:
+          type: string
+          example: BTC-USD
+        leverage:
+          type: integer
+          minimum: 1
+          maximum: 125
+          description: Must also be within the market's margin tiers
+          example: 10
         vault_id:
           type: string
-          description: Optional vault ID to trade on behalf of a vault (leader only)
-          example: vault-abc-123
-    CreateBatchOrdersResponse:
+        sub_account_id:
+          type: string
+    LeverageResponse:
       type: object
       properties:
-        successful:
-          type: array
-          description: Successfully created orders
-          items:
-            $ref: '#/components/schemas/CreateOrderResponse'
-        failed:
-          type: array
-          description: Orders that failed to create
-          items:
-            type: object
-            properties:
-              index:
-                type: integer
-                description: Index of the failed order in the request array
-                example: 2
-              error:
-                type: string
-                description: Error message
-                example: insufficient margin
-    ReplaceOrderRequest:
+        leverage:
+          type: integer
+          example: 10
+        maxNotionalValue:
+          type: string
+          description: Max position notional of the margin tier selected by this leverage
+          example: '1000000'
+        symbol:
+          type: string
+          example: BTC-USD
+        request_id:
+          type: string
+          description: Correlates the engine's accept/reject of this change on the user stream
+          example: 019a0c2e-3333-7000-8000-000000000003
+    MarginModeRequest:
       type: object
       required:
-      - cancel
-      - new_order
+      - symbol
+      - marginMode
       properties:
-        cancel:
-          $ref: '#/components/schemas/CancelOrderRequest'
-          description: The order to cancel
-        new_order:
-          $ref: '#/components/schemas/CreateOrderRequest'
-          description: The new order to create
+        symbol:
+          type: string
+          example: BTC-USD
+        marginMode:
+          type: string
+          enum:
+          - cross
+          - isolated
         vault_id:
           type: string
-          description: Optional vault ID to replace on behalf of a vault (leader only)
-          example: vault-abc-123
-    ReplaceOrderResponse:
+        sub_account_id:
+          type: string
+    MarginModeResponse:
       type: object
       properties:
-        cancel:
-          $ref: '#/components/schemas/CancelOrderResponse'
-        new_order:
-          $ref: '#/components/schemas/CreateOrderResponse'
-    ReplaceBatchOrdersRequest:
+        marginMode:
+          type: string
+          enum:
+          - cross
+          - isolated
+        symbol:
+          type: string
+    SymbolSetting:
+      type: object
+      properties:
+        margin_mode:
+          type: string
+          enum:
+          - cross
+          - isolated
+        leverage:
+          type: integer
+          example: 20
+    SymbolSettingsResponse:
+      type: object
+      properties:
+        default_margin_mode:
+          type: string
+          enum:
+          - cross
+          - isolated
+        default_leverage:
+          type: integer
+          example: 20
+        symbol_settings:
+          type: object
+          description: Effective settings for every listed market, keyed by symbol
+          additionalProperties:
+            $ref: '#/components/schemas/SymbolSetting'
+          example:
+            BTC-USD:
+              margin_mode: cross
+              leverage: 20
+    UpdateSymbolsRequest:
+      type: object
+      description: All fields optional; same names as `GET /v2/symbols`. Omitted / empty / 0 values are left unchanged.
+      properties:
+        default_margin_mode:
+          type: string
+          enum:
+          - cross
+          - isolated
+        default_leverage:
+          type: integer
+          description: Must be >= 1 and <= the highest max leverage across markets
+        symbol_settings:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/SymbolSetting'
+        vault_id:
+          type: string
+        sub_account_id:
+          type: string
+    ModifyMarginRequest:
       type: object
       required:
-      - replacements
+      - symbol
+      - amount
+      - modify_type
       properties:
-        replacements:
-          type: array
-          description: Array of replace operations (minimum 1)
-          minItems: 1
-          items:
-            $ref: '#/components/schemas/ReplaceOrderRequest'
+        symbol:
+          type: string
+          example: BTC-USD
+        amount:
+          type: string
+          description: USD amount, > 0
+          example: '100'
+        modify_type:
+          type: string
+          enum:
+          - add
+          - remove
         vault_id:
           type: string
-          description: Optional vault ID to replace on behalf of a vault (leader only)
-          example: vault-abc-123
-    ReplaceBatchOrdersResponse:
+        sub_account_id:
+          type: string
+    ModifyMarginResponse:
       type: object
       properties:
-        results:
-          type: array
-          description: Results for each replacement operation
-          items:
-            $ref: '#/components/schemas/ReplaceOrderResponse'
+        symbol:
+          type: string
+        request_id:
+          type: string
+          description: Correlates the engine's accept/reject on the user stream
+        sequence_id:
+          type: integer
+          format: int64
+        message_id:
+          type: string
     CreateTwapRequest:
       type: object
       required:
@@ -721,74 +1089,67 @@ components:
       properties:
         symbol:
           type: string
-          description: Trading pair symbol
-          example: BTC-USDT
+          example: BTC-USD
         side:
           type: string
           enum:
           - BUY
           - SELL
-          description: Order side
-          example: BUY
+          description: Uppercase (unlike orders)
         total_size:
           type: string
-          description: Total quantity to execute (decimal string)
+          description: Base-asset size; rounded down to the market step size
           example: '1.5'
         duration_sec:
           type: integer
-          description: Execution duration in seconds (min 300, max 86400)
           minimum: 300
           maximum: 86400
           example: 3600
         limit_price:
           type: string
-          description: Optional hard cap price. Slices whose projected fill price would cross it are skipped.
-          example: '45000.00'
+          description: Optional cap (> 0). Slices whose projected fill price crosses it are skipped and the shortfall rolls into later slices.
+          example: '52000'
         reduce_only:
           type: boolean
           default: false
-          description: If true, slices can only reduce an existing position
         randomize:
           type: boolean
           default: false
-          description: Enable time/size jitter to reduce predictability
+          description: Jitter slice timing and size
+        vault_id:
+          type: string
+        sub_account_id:
+          type: string
     CreateTwapResponse:
       type: object
       properties:
         strategy_id:
           type: string
-          description: Unique strategy identifier (UUID v7)
-          example: 019681a3-7e00-7000-8000-000000000001
+          description: UUIDv7
+          example: 019a0c2e-4444-7000-8000-000000000004
         status:
           type: string
-          description: Initial status (always "active")
-          example: active
+          enum:
+          - active
     CancelTwapResponse:
       type: object
       properties:
         strategy_id:
           type: string
-          description: Strategy identifier
-          example: 019681a3-7e00-7000-8000-000000000001
         status:
           type: string
-          description: Status after cancellation request (always "cancelling")
-          example: cancelling
+          enum:
+          - cancelling
     TwapStrategyView:
       type: object
       properties:
         strategy_id:
           type: string
-          description: Unique strategy identifier
-          example: 019681a3-7e00-7000-8000-000000000001
         account_id:
           type: string
-          description: Account that owns the strategy
-          example: 01234567-89ab-cdef-0123-456789abcdef
         market:
           type: string
-          description: Trading pair symbol
-          example: BTC-USDT
+          example: BTC-USD
         status:
           type: string
           enum:
@@ -800,320 +1161,181 @@ components:
           - expired
           - failed
           - liquidated
-          description: Current strategy status
-          example: active
         side:
           type: string
           enum:
           - BUY
           - SELL
-          description: Order side
-          example: BUY
         total_size:
           type: string
-          description: Total quantity to execute
           example: '1.5'
         filled_size:
           type: string
-          description: Quantity executed so far
           example: '0.75'
         duration_sec:
           type: integer
-          description: Execution duration in seconds
           example: 3600
         slices_fired:
           type: integer
-          description: Number of child orders placed so far
           example: 60
         nominal_slices:
           type: integer
-          description: Expected total number of slices
+          description: clamp(duration_sec / 30, 5, 120)
           example: 120
         created_at_ms:
           type: integer
           format: int64
-          description: Creation timestamp (ms)
-          example: 1713806400000
         updated_at_ms:
           type: integer
           format: int64
-          description: Last update timestamp (ms)
-          example: 1713810000000
         completed_at_ms:
           type: integer
           format: int64
-          nullable: true
-          description: Completion timestamp (ms), null while active
-          example: null
+          description: Omitted until the strategy reaches a terminal status
         last_error:
           type: string
-          description: Error message if strategy failed
-          example: ''
-    OrderHistoryEntry:
-      type: object
-      description: |
-        Order history entry. Includes all standard Order fields plus strategy linkage when the order belongs to a TWAP or bracket strategy.
-      properties:
-        ID:
-          type: integer
-          format: int64
-          description: Order ID
-          example: 123456
-        ClientOrderID:
-          type: string
-          description: Client order ID
-          example: twap-019681a3-1
-        AccountID:
-          type: string
-          description: Account ID
-          example: 01234567-89ab-cdef-0123-456789abcdef
-        Symbol:
-          type: string
-          description: Trading pair
-          example: BTC-USDT
-        Strategy:
-          type: object
-          nullable: true
-          description: Strategy linkage (present for TWAP / bracket orders)
-          properties:
-            ID:
-              type: string
-              description: Parent strategy ID
-            IsPrimary:
-              type: boolean
-              description: Whether this is the primary order in the strategy
-        Side:
-          type: string
-          example: buy
-        Status:
-          type: string
-          example: filled
-        Type:
-          type: string
-          example: market
-        Size:
-          type: string
-          example: '0.125'
-        Filled:
-          type: string
-          example: '0.125'
-        Price:
-          type: string
-          example: '45000.00'
-        CreateTimestamp:
-          type: integer
-          format: int64
-          example: 1713806400000
-        EventTimestamp:
-          type: integer
-          format: int64
-          example: 1713806400150
-    FillHistoryEntry:
+          description: Omitted when empty and always omitted on public reads
+    TwapListResponse:
       type: object
       properties:
-        trade_id:
-          type: integer
-          format: int64
-          description: Unique fill identifier
-          example: 789012
-        order_id:
-          type: integer
-          format: int64
-          description: Parent order ID
-          example: 123456
-        symbol:
-          type: string
-          example: BTC-USDT
-        side:
-          type: string
-          example: buy
-        price:
-          type: string
-          example: '45000.00'
-        size:
-          type: string
-          example: '0.125'
-        fee:
-          type: string
-          example: '0.005625'
-        fee_type:
-          type: string
-          example: taker
-        realized_pnl:
-          type: string
-          example: '0'
-        timestamp:
-          type: integer
-          format: int64
-          example: 1713806400150
-    LeverageRequest:
-      type: object
-      required:
-      - symbol
-      - leverage
-      properties:
-        symbol:
-          type: string
-          description: Trading pair symbol
-          example: BTC-USD
-        leverage:
-          type: integer
-          minimum: 1
-          maximum: 125
-          description: New leverage value
-          example: 10
-        vault_id:
-          type: string
-          description: Optional vault ID. When provided, updates leverage for the vault account. Caller
-            must be the vault leader.
-    LeverageResponse:
-      type: object
-      properties:
-        leverage:
-          type: integer
-          description: New leverage value
-          example: 10
-        maxNotionalValue:
-          type: string
-          description: Maximum notional value at this leverage
-          example: '1000000'
-        symbol:
-          type: string
-          description: Trading pair symbol
-          example: BTC-USD
-    MarginModeRequest:
-      type: object
-      required:
-      - symbol
-      - marginMode
-      properties:
-        symbol:
-          type: string
-          description: Trading pair symbol
-          example: BTC-USD
-        marginMode:
-          type: string
-          enum:
-          - cross
-          - isolated
-          description: New margin mode
-          example: isolated
-        vault_id:
-          type: string
-          description: Optional vault ID. When provided, updates margin mode for the vault account. Caller
-            must be the vault leader.
-    MarginModeResponse:
-      type: object
-      properties:
-        marginMode:
-          type: string
-          description: New margin mode
-          example: isolated
-        symbol:
-          type: string
-          description: Trading pair symbol
-          example: BTC-USD
-    ModifyMarginRequest:
-      type: object
-      required:
-      - symbol
-      - amount
-      - modify_type
-      properties:
-        symbol:
-          type: string
-          description: Trading pair symbol
-          example: BTC-USD
-        amount:
-          type: string
-          description: Amount to add or remove
-          example: '500.00'
-        modify_type:
-          type: string
-          description: Modify type (add|remove)
-          example: add|remove
-        vault_id:
-          type: string
-          description: Optional vault ID. When provided, modifies margin for the vault's isolated position.
-            Caller must be the vault leader.
-    ModifyMarginResponse:
-      type: object
-      properties:
-        symbol:
-          type: string
-          description: Trading pair symbol
-          example: BTC-USD
-        sequence_id:
-          type: integer
-          format: int64
-          description: Sequence ID
-          example: 789012
-        message_id:
-          type: string
-          description: Message ID
-          example: msg_xyz
+        strategies:
+          type: array
+          items:
+            $ref: '#/components/schemas/TwapStrategyView'
+        accounts:
+          type: array
+          description: Only with `scope=all`
+          items:
+            $ref: '#/components/schemas/AggregateAccountRef'
   responses:
-    MissingParameter:
-      description: Missing required parameter
-      content:
-        application/json:
-          schema:
-            $ref: '#/components/schemas/Error'
-          example:
-            error: MISSING_PARAMETER
-            code: MISSING_PARAMETER
-            msg: symbol parameter is required
-    InvalidParameter:
-      description: Invalid parameter value
-      content:
-        application/json:
-          schema:
-            $ref: '#/components/schemas/Error'
-          example:
-            error: INVALID_PARAMETER
-            code: INVALID_PARAMETER
-            msg: invalid parameter
-    Unauthorized:
-      description: Unauthorized - missing or invalid API wallet authentication
+    BadRequest:
+      description: Invalid request (binding error, validation failure, or `vault_id` + `sub_account_id` both set)
       content:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
           examples:
+            binding:
+              value:
+                error: 'Key: ''CreateOrderRequest.Side'' Error:Field validation for ''Side'' failed on the ''required'' tag'
+            reserved_prefix:
+              value:
+                error: client_order_id must not start with reserved prefix "liq_"
+            builder_fee:
+              value:
+                error: X-Builder-Fee-Bps 50 exceeds your approved max of 20
+            exclusive:
+              value:
+                error: vault_id and sub_account_id are mutually exclusive
+    Unauthorized:
+      description: Missing or invalid authentication
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          examples:
+            no_auth:
+              value:
+                error: missing authorization header
             missing_headers:
-              summary: Missing authentication headers
               value:
                 error: missing API wallet authentication headers
-            invalid_signature:
-              summary: Invalid or expired signature
+            bad_signature:
               value:
                 error: authentication failed
+            stale:
+              value:
+                error: signature expired or invalid timestamp
+            replay:
+              value:
+                error: request already processed
+    Forbidden:
+      description: Not allowed for this caller (vault leader check, inactive vault, sub-account ownership)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          examples:
+            vault_leader:
+              value:
+                error: only vault leader can trade on vault account
+            vault_paused:
+              value:
+                error: vault trading is paused
+            vault_leader_other:
+              summary: Cancel / replace / strategy / leverage / margin / TWAP routes
+              value:
+                error: only vault leader can perform this action on vault account
+            vault_inactive_other:
+              summary: Replace / strategy routes
+              value:
+                error: vault is paused
+            sub_account:
+              value:
+                error: sub-account access denied
     NotFound:
-      description: Resource not found
+      description: Account, vault or order not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          examples:
+            account:
+              value:
+                error: account not found
+            vault:
+              value:
+                error: vault not found
+    RateLimited:
+      description: Per-API-wallet (or per-IP) request limit exceeded
       content:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
           example:
-            error: not found
+            error: rate limit exceeded
+    TwapUnavailable:
+      description: TWAP service not configured on this deployment
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: algo twap service not configured
 paths:
   /v2/order:
     post:
       tags:
       - Orders
-      summary: Create new order
+      summary: Create order
       description: |
-        Create a new order. Supports the following order types:
+        Creates one order. Returns `201` once the command is sequenced (`status: "pending"`).
 
-        | Type | Description |
-        |------|-------------|
-        | `limit` | Limit order at specified price |
-        | `market` | Market order at best available price |
-        | `stop` | Stop market order triggered at stop_price |
-        | `stop_limit` | Stop limit order triggered at stop_price |
-        | `take_profit` | Take profit market order |
-        | `take_profit_limit` | Take profit limit order |
-        | `trailing_stop_market` | Trailing stop market order that tracks price movement |
+        | Type | Executes as | Needs |
+        |------|-------------|-------|
+        | `limit` | resting/taking limit | `price` |
+        | `market` | market (remainder canceled) | optional `slippage` |
+        | `stop` / `take_profit` | market on trigger | `stop_price` |
+        | `stop_limit` / `take_profit_limit` | limit at `price` on trigger | `stop_price`, `price` |
+        | `trailing_stop_market` | market on trigger | `callback_rate`, `reduce_only: true` |
+
+        Trigger direction: `stop*` sell triggers at price <= stop_price, buy at >=; `take_profit*`
+        sell at >=, buy at <=. A conditional order that would trigger immediately is rejected
+        (`conditional_order_triggers_immediately`). `working_type` defaults to `mark_price` for
+        stop/take-profit types and `contract_price` for trailing stops.
+
+        Time in force: `GTC` (default) rests; `IOC` expires the unfilled remainder; `FOK` expires
+        the whole order if it cannot fill completely. Market orders never rest.
+
+        Self-trade prevention is automatic (expire-maker): a taker never fills against a resting
+        order of the same account, the same master account family, or the same server-assigned
+        STP group; the resting order is expired with `CloseReason: order_expired_in_match`.
+
+        Synchronous `400`s cover only body/ID/vault checks and a missing `stop_price` on
+        stop/take-profit types (`invalid_stop_price`). All market-rule, margin and position checks
+        happen in the engine; see the reason codes in the `strike-trading` skill.
+      parameters:
+      - $ref: '#/components/parameters/BuilderFeeBps'
       requestBody:
         required: true
         content:
@@ -1121,400 +1343,793 @@ paths:
             schema:
               $ref: '#/components/schemas/CreateOrderRequest'
             examples:
-              limit_order:
-                summary: Limit buy order
+              limit_post_only:
+                summary: Post-only limit buy
                 value:
+                  client_order_id: mm-bid-1
                   symbol: BTC-USD
                   side: buy
                   type: limit
                   size: '0.1'
-                  price: '50000.00'
-                  time_in_force: GTC
-              market_order:
-                summary: Market sell order
+                  price: '50000'
+                  post_only: true
+              market_with_slippage:
+                summary: Market sell, 1% max slippage
                 value:
                   symbol: BTC-USD
                   side: sell
                   type: market
                   size: '0.1'
-              stop_order:
-                summary: Stop loss order
+                  slippage: '0.01'
+              stop_loss:
+                summary: Reduce-only stop-market
                 value:
                   symbol: BTC-USD
                   side: sell
                   type: stop
                   size: '0.1'
-                  stop_price: '48000.00'
+                  stop_price: '48000'
                   reduce_only: true
-              trailing_stop_order:
-                summary: Trailing stop loss order
+              trailing_stop:
+                summary: Trailing stop protecting a long
                 value:
                   symbol: BTC-USD
                   side: sell
                   type: trailing_stop_market
-                  size: '1'
-                  callback_rate: '5'
+                  size: '0.1'
+                  callback_rate: '1.5'
                   activation_price: '67000'
-                  working_type: contract_price
-                  reduce_only: true
-              trailing_stop_immediate:
-                summary: Trailing stop with immediate activation
-                value:
-                  symbol: BTC-USD
-                  side: sell
-                  type: trailing_stop_market
-                  size: '1'
-                  callback_rate: '3'
-                  working_type: contract_price
                   reduce_only: true
       responses:
         '201':
-          description: Order created successfully
+          description: Accepted and sequenced
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/CreateOrderResponse'
         '400':
-          $ref: '#/components/responses/InvalidParameter'
+          $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          description: Publish failure (`failed to create order`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
     get:
       tags:
       - Orders
-      summary: Get order by ID
-      description: Get a specific order by order_id or client_order_id. At least one ID must be provided.
-        Supports unauthenticated access when vault_id is provided.
+      summary: Get one order
+      description: |
+        Looks up an order by `order_id` or `client_order_id` (client ID wins when both are given).
+        Working orders come from live state; filled/canceled/rejected/expired orders fall back to
+        order history, so a rejected order stays retrievable by its `client_order_id`.
+        Readable without auth when `account_id`, `vault_id` or `blockchain_address` is given;
+        otherwise returns the caller's order (or `sub_account_id`'s).
+      security:
+      - ApiWalletAuth: []
+      - {}
       parameters:
-      - name: symbol
-        in: query
-        required: true
-        description: Trading pair symbol
-        schema:
-          type: string
-        example: BTC-USD
+      - $ref: '#/components/parameters/SymbolPath'
       - name: order_id
         in: query
         required: false
-        description: Server-assigned order ID
         schema:
           type: integer
           format: int64
       - name: client_order_id
         in: query
         required: false
-        description: Client-provided order ID
         schema:
           type: string
-      - name: vault_id
-        in: query
-        required: false
-        description: Vault ID for public vault order queries (no authentication required when provided)
-        schema:
-          type: string
+      - $ref: '#/components/parameters/AccountIdQuery'
+      - $ref: '#/components/parameters/VaultIdQuery'
+      - $ref: '#/components/parameters/BlockchainQuery'
+      - $ref: '#/components/parameters/BlockchainAddressQuery'
+      - $ref: '#/components/parameters/SubAccountIdQuery'
       responses:
         '200':
-          description: Successful response
+          description: The order
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Order'
         '400':
-          $ref: '#/components/responses/MissingParameter'
+          description: '`symbol parameter is required`, `either order_id or client_order_id parameter is required`, `invalid order_id format`, `invalid account_id`, `invalid vault id`'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '401':
-          $ref: '#/components/responses/Unauthorized'
+          description: No auth and no public selector (`authentication required or provide vault_id, account_id, or blockchain_address`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '404':
-          $ref: '#/components/responses/NotFound'
+          description: '`order not found`, `account not found`, `user not found`'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /v2/openOrders:
+    get:
+      tags:
+      - Orders
+      summary: List open orders
+      description: |
+        Orders in status `pending`, `open` or `untriggered`, newest first. Same public selectors as
+        `GET /v2/order`. `scope=all` returns the master account plus its active sub-accounts in one
+        list (adds `accounts`); it cannot be combined with `vault_id` / `sub_account_id` and is
+        refused (`403`) for sub-account API wallets.
+      security:
+      - ApiWalletAuth: []
+      - {}
+      parameters:
+      - name: symbol
+        in: query
+        required: false
+        schema:
+          type: string
+        example: BTC-USD
+      - name: scope
+        in: query
+        required: false
+        schema:
+          type: string
+          enum:
+          - all
+      - $ref: '#/components/parameters/AccountIdQuery'
+      - $ref: '#/components/parameters/VaultIdQuery'
+      - $ref: '#/components/parameters/BlockchainQuery'
+      - $ref: '#/components/parameters/BlockchainAddressQuery'
+      - $ref: '#/components/parameters/SubAccountIdQuery'
+      responses:
+        '200':
+          description: Open orders
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OpenOrdersResponse'
+        '400':
+          description: '`invalid scope: only scope=all is supported`, `scope=all cannot be combined with vault_id`, `invalid account_id`, `invalid vault id`'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: No auth and no public selector; `authentication required for scope=all`
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: '`scope=all is not available to sub-account API keys`'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: '`account not found`'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /v2/order/cancel:
     delete:
       tags:
       - Orders
       summary: Cancel order
-      description: Cancel a specific order by order_id.
+      description: |
+        Cancels one order by `order_id` or `client_order_id`. **The JSON body is required on this
+        DELETE** (OpenAPI 3.0 tools and some HTTP clients drop DELETE bodies - make sure yours
+        sends it, and sign its hash). Returns as soon as the cancel is sequenced; an unknown `order_id` is not detected
+        here (the engine drops the cancel; no event). `client_order_id` is resolved synchronously against working
+        orders and returns `404 order not found` when none matches.
       requestBody:
         required: true
         content:
           application/json:
             schema:
               $ref: '#/components/schemas/CancelOrderRequest'
+            example:
+              order_id: 33428500
+              symbol: BTC-USD
       responses:
         '200':
-          description: Cancel request submitted
+          description: Cancel sequenced
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/CancelOrderResponse'
         '400':
-          $ref: '#/components/responses/InvalidParameter'
+          description: '`either order_id or client_order_id parameter is required`, `vault_id and sub_account_id are mutually exclusive`, binding errors'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: '`order not found` (client_order_id), `vault not found`'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /v2/order/cancel-all:
     delete:
       tags:
       - Orders
       summary: Cancel all orders
-      description: Cancel all open orders. Optionally filter by symbol to cancel only orders for a specific
-        trading pair.
-      requestBody:
-        required: false
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/CancelAllOrdersRequest'
-      responses:
-        '200':
-          description: Cancel request submitted
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/CancelAllOrdersResponse'
-        '401':
-          $ref: '#/components/responses/Unauthorized'
-        '404':
-          $ref: '#/components/responses/NotFound'
-  /v2/order/strategy:
-    post:
-      tags:
-      - Orders
-      summary: Create strategy order (bracket order)
-      description: |
-        Create a strategy order with optional take-profit (TP) and stop-loss (SL) orders.
-
-        **Requirements:**
-        - At least one of `tp_order` or `sl_order` must be provided
-        - The primary order executes first
-        - TP/SL orders are placed when the primary order fills
-        - If one TP/SL triggers, the other is automatically canceled
+      description: Cancels every active order (open, pending and untriggered conditionals) on one symbol or on all symbols. **The JSON body is required on this DELETE** - send `{}` for all symbols (an empty body is `400 {"error":"EOF"}`; OpenAPI 3.0 tools and some HTTP clients drop DELETE bodies).
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/CreateStrategyOrderRequest'
-            examples:
-              bracket_order:
-                summary: Long position with TP and SL
-                value:
-                  strategy_id: strategy-001
-                  client_order_id: entry-001
-                  symbol: BTC-USD
-                  side: buy
-                  type: limit
-                  size: '0.1'
-                  price: '50000.00'
-                  tp_order:
-                    type: take_profit
-                    size: '0.1'
-                    stop_price: '55000.00'
-                  sl_order:
-                    type: stop
-                    size: '0.1'
-                    stop_price: '48000.00'
+              $ref: '#/components/schemas/CancelAllOrdersRequest'
+            example:
+              symbol: BTC-USD
       responses:
-        '201':
-          description: Strategy order created
+        '200':
+          description: Cancel-all sequenced
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/CreateStrategyOrderResponse'
+                $ref: '#/components/schemas/CancelAllOrdersResponse'
         '400':
-          $ref: '#/components/responses/InvalidParameter'
+          $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
   /v2/orders/batch:
     post:
       tags:
       - Orders
-      summary: Create batch orders
+      summary: Create orders in a batch
       description: |
-        Create multiple orders in a single request. Each order is processed independently — some may succeed while others fail. The response always returns HTTP 200 with both successful and failed results.
+        Places each order independently, in order, as separate engine commands (no atomicity, may
+        span symbols). Returns `200` once the request-level checks pass; per-order API-side
+        failures are then listed in `failed` with their index. Request-level failures reject the
+        whole batch: binding errors, a reserved `client_order_id` prefix in any item, builder-fee
+        errors, `vault_id` + `sub_account_id`, sub-account ownership (`403`). Items are not
+        field-validated at bind time, and items hitting a silently-dropped engine reject (see the
+        top of this spec) appear in `successful`. No item cap beyond the 8 MiB body limit.
+      parameters:
+      - $ref: '#/components/parameters/BuilderFeeBps'
       requestBody:
         required: true
         content:
           application/json:
             schema:
               $ref: '#/components/schemas/CreateBatchOrdersRequest'
-            examples:
-              batch_limit_orders:
-                summary: Multiple limit orders
-                value:
-                  orders:
-                  - symbol: BTC-USD
-                    side: buy
-                    type: limit
-                    size: '0.1'
-                    price: '49000.00'
-                  - symbol: BTC-USD
-                    side: buy
-                    type: limit
-                    size: '0.1'
-                    price: '48000.00'
+            example:
+              orders:
+              - symbol: BTC-USD
+                side: buy
+                type: limit
+                size: '0.1'
+                price: '49000'
+                post_only: true
+              - symbol: ETH-USD
+                side: sell
+                type: limit
+                size: '1'
+                price: '3600'
+                post_only: true
       responses:
         '200':
-          description: Batch processing complete (check individual results for failures)
+          description: Batch processed
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/CreateBatchOrdersResponse'
+              example:
+                successful:
+                - client_order_id: 019a0c2e-7f3a-7c4e-9b1d-2f6e8a1c3b5d
+                  account_id: 019a0c2e-1111-7000-8000-000000000001
+                  symbol: BTC-USD
+                  status: pending
+                  sequence_id: 70804200
+                  message_id: 1775914565478-1
+                failed:
+                - index: 1
+                  error: invalid_symbol
         '400':
-          $ref: '#/components/responses/InvalidParameter'
+          $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /v2/orders/replace:
+    post:
+      tags:
+      - Orders
+      summary: Replace all orders on a symbol
+      description: |
+        One engine command that cancels every active order the account has on `symbol` (including
+        untriggered TP/SL and other conditionals) and then places `orders` in request order -
+        a quote refresh for market makers.
+
+        Engine semantics (same as `/v2/order/replace-batch`): if any new order fails static market
+        rules (size/step, tick, price range/bound, min notional, `invalid_stop_price`) the whole
+        command is dropped - nothing is canceled, the failing order is published as `rejected`,
+        the rest are never created. Otherwise cancels apply first, then creates run in order; the
+        first create rejected for any other reason (margin, post-only cross, ...) stops the batch
+        and later creates are skipped without order events. A create rejected with
+        `conditional_order_triggers_immediately` does not stop the batch.
+        Limit: 1000 operations (cancel-all counts as one). Duplicate `client_order_id`s in one
+        request: `400 duplicate_request_id`. Items in `orders` are not field-validated at bind
+        time; an item with missing `side`/`type`, or an unknown `symbol`, drops the whole command
+        silently (no cancels, no events).
+      parameters:
+      - $ref: '#/components/parameters/BuilderFeeBps'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReplaceSymbolOrdersRequest'
+            example:
+              symbol: BTC-USD
+              orders:
+              - client_order_id: bid-1
+                side: buy
+                type: limit
+                size: '0.2'
+                price: '49990'
+                post_only: true
+              - client_order_id: ask-1
+                side: sell
+                type: limit
+                size: '0.2'
+                price: '50010'
+                post_only: true
+      responses:
+        '200':
+          description: Command sequenced
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReplaceSymbolOrdersResponse'
+        '400':
+          description: 'Binding errors, `duplicate_request_id`, `slippage_only_for_market_orders`, `slippage_must_be_positive`, `invalid_stop_price`, `batch_replace_orders: total operations exceed 1000`'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
   /v2/order/replace:
     post:
       tags:
       - Orders
-      summary: Replace order
+      summary: Replace one order
       description: |
-        Atomically cancel an existing order and create a new one. The cancel is executed first; if it fails, the new order is not created.
+        Cancel one order and create one order in a single engine command (either leg may be
+        omitted). Both legs must be on the same symbol. Same engine semantics as
+        `/v2/order/replace-batch`. `X-Builder-Fee-Bps` is ignored here and the new order carries no
+        builder code (no builder fee or attribution). `vault_id` is copied from the top level into
+        legs that don't set one.
       requestBody:
         required: true
         content:
           application/json:
             schema:
               $ref: '#/components/schemas/ReplaceOrderRequest'
-            examples:
-              replace_limit:
-                summary: Replace a limit order with new price
-                value:
-                  cancel:
-                    order_id: 123456
-                    symbol: BTC-USD
-                  new_order:
-                    symbol: BTC-USD
-                    side: buy
-                    type: limit
-                    size: '0.1'
-                    price: '49500.00'
+            example:
+              cancel:
+                order_id: 33428500
+                symbol: BTC-USD
+              new_order:
+                symbol: BTC-USD
+                side: buy
+                type: limit
+                size: '0.1'
+                price: '49500'
+                post_only: true
       responses:
         '200':
-          description: Order replaced successfully
+          description: Command sequenced
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ReplaceOrderResponse'
+              example:
+                cancel:
+                  order_id: 33428500
+                  symbol: BTC-USD
+                new_order:
+                  client_order_id: 019a0c2e-7f3a-7c4e-9b1d-2f6e8a1c3b5e
+                  account_id: 019a0c2e-1111-7000-8000-000000000001
+                  symbol: BTC-USD
+                  status: pending
+                sequence_id: 70804202
+                message_id: 1775914565500-0
         '400':
-          $ref: '#/components/responses/InvalidParameter'
+          description: '`replacement at index 0 must include cancel or new_order`, `order_id_not_set`, `mismatched_order_symbol`, `invalid_symbol`, `new_order vault_id mismatch at index 0`, binding errors'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
   /v2/order/replace-batch:
     post:
       tags:
       - Orders
-      summary: Replace batch orders
+      summary: Replace many orders on one symbol
       description: |
-        Replace multiple orders in a single request. Each replacement is an atomic cancel + create pair. If any individual cancel fails, the entire batch is aborted.
+        All cancels and creates go to the engine as one command for one symbol (every leg must use
+        the same symbol). Each replacement may carry `cancel`, `new_order` or both. Cancel legs
+        need `order_id`; unknown IDs are skipped.
+
+        Engine semantics: if any create fails static market rules, nothing is applied (no cancels)
+        and that create is published as `rejected`. Otherwise all cancels apply, then creates run
+        in order until the first rejection (other than
+        `conditional_order_triggers_immediately`); remaining creates are skipped with no order
+        event. Limit: 1000 operations per request. A create with missing `side`/`type`, or an
+        unknown symbol, drops the whole command silently (no cancels, no events).
+      parameters:
+      - $ref: '#/components/parameters/BuilderFeeBps'
       requestBody:
         required: true
         content:
           application/json:
             schema:
               $ref: '#/components/schemas/ReplaceBatchOrdersRequest'
-            examples:
-              replace_batch:
-                summary: Replace multiple limit orders
-                value:
-                  replacements:
-                  - cancel:
-                      order_id: 123456
-                      symbol: BTC-USD
-                    new_order:
-                      symbol: BTC-USD
-                      side: buy
-                      type: limit
-                      size: '0.1'
-                      price: '49500.00'
-                  - cancel:
-                      order_id: 123457
-                      symbol: BTC-USD
-                    new_order:
-                      symbol: BTC-USD
-                      side: sell
-                      type: limit
-                      size: '0.1'
-                      price: '51500.00'
+            example:
+              replacements:
+              - cancel:
+                  order_id: 33428500
+                  symbol: BTC-USD
+                new_order:
+                  symbol: BTC-USD
+                  side: buy
+                  type: limit
+                  size: '0.1'
+                  price: '49500'
+                  post_only: true
+              - cancel:
+                  order_id: 33428501
+                  symbol: BTC-USD
+                new_order:
+                  symbol: BTC-USD
+                  side: sell
+                  type: limit
+                  size: '0.1'
+                  price: '50500'
+                  post_only: true
       responses:
         '200':
-          description: Batch replacement complete
+          description: Command sequenced
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ReplaceBatchOrdersResponse'
         '400':
-          $ref: '#/components/responses/InvalidParameter'
-        '401':
-          $ref: '#/components/responses/Unauthorized'
-  /v2/openOrders:
-    get:
-      tags:
-      - Orders
-      summary: Get open orders
-      description: Get all open orders for the account. Optionally filter by symbol. Supports unauthenticated
-        access when vault_id is provided.
-      parameters:
-      - name: symbol
-        in: query
-        required: false
-        description: Filter by trading pair symbol
-        schema:
-          type: string
-        example: BTC-USD
-      - name: vault_id
-        in: query
-        required: false
-        description: Vault ID for public vault order queries (no authentication required when provided)
-        schema:
-          type: string
-      responses:
-        '200':
-          description: Successful response
+          description: 'Per-item build failures carry `failed_index` (`replacement at index i must include cancel or new_order`, `vault_id mismatch at index i`, `cancel vault_id mismatch at index i`, `new_order vault_id mismatch at index i`, `order_id_not_set`, `invalid_symbol`, `mismatched_order_symbol`). Command-level failures (`duplicate_request_id`, `batch_replace_orders: total operations exceed 1000`, slippage errors, `invalid_stop_price`) and binding errors return only `error`.'
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/OpenOrdersResponse'
+                anyOf:
+                - $ref: '#/components/schemas/BatchValidationError'
+                - $ref: '#/components/schemas/Error'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /v2/order/strategy:
+    post:
+      tags:
+      - Strategy
+      summary: Create bracket order (primary + TP/SL)
+      description: |
+        Places a primary order with a take-profit and/or stop-loss leg linked by `strategy_id`.
+        Legs wait in `pending` until the primary fills, then become `untriggered` reduce-only
+        conditionals on the opposite side. When one leg triggers the other expires
+        (`order_strategy_secondary_oco`); if the primary closes without filling the legs expire
+        (`order_strategy_primary_closed`).
+
+        Synchronous `400 invalid_secondary_order` when: TP type is not `take_profit*`, SL type is
+        not `stop*`, or (both legs) TP stop_price < SL stop_price for a buy primary / TP > SL for a
+        sell primary. A leg with `stop_price` missing or <= 0 fails earlier with
+        `400 invalid_stop_price`. `callback_rate`, `activation_price` and `slippage` are not part
+        of this body and are ignored if sent, so trailing stops and market slippage are not
+        available on the primary. Vault errors here read `only vault leader can perform this
+        action on vault account` / `vault is <status>`.
+      parameters:
+      - $ref: '#/components/parameters/BuilderFeeBps'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateStrategyOrderRequest'
+            example:
+              strategy_id: 019a0c2e-2222-7000-8000-000000000002
+              symbol: BTC-USD
+              side: buy
+              type: limit
+              size: '0.1'
+              price: '50000'
+              tp_order:
+                type: take_profit
+                size: '0.1'
+                stop_price: '55000'
+              sl_order:
+                type: stop
+                size: '0.1'
+                stop_price: '48000'
+      responses:
+        '201':
+          description: Strategy sequenced
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateStrategyOrderResponse'
+        '400':
+          description: '`at least one of tp_order or sl_order must be provided`, `invalid_secondary_order`, `invalid_stop_price`, binding errors'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    get:
+      tags:
+      - Strategy
+      summary: Get strategy order (not implemented)
+      description: Route exists but always returns `501`. Read bracket legs from `GET /v2/openOrders` / `GET /v2/order` (`Strategy.ID`).
+      security:
+      - ApiWalletAuth: []
+      - {}
+      responses:
+        '501':
+          description: Not implemented
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: not implemented
+  /v2/leverage:
+    post:
+      tags:
+      - Trading
+      summary: Set leverage for a symbol
+      description: |
+        Sets the symbol's leverage. Applies to the open position too (its initial margin is
+        recomputed). The engine rejects (async, via the user stream with `request_id`):
+        a decrease on an isolated position (`leverage_decrease_not_allowed`), a cross decrease
+        without enough balance, or a position larger than the new tier's max notional
+        (`position_notional_exceed`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LeverageRequest'
+            example:
+              symbol: BTC-USD
+              leverage: 10
+      responses:
+        '200':
+          description: Change sequenced
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LeverageResponse'
+        '400':
+          description: '`invalid symbol`, leverage outside 1-125 (binding error), or above the market max'
+          content:
+            application/json:
+              schema:
+                anyOf:
+                - $ref: '#/components/schemas/LeverageTooHighError'
+                - $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /v2/marginMode:
+    post:
+      tags:
+      - Trading
+      summary: Set margin mode for a symbol
+      description: Switches a symbol between `cross` and `isolated`. Refused with an open position (sync `400`). The engine also refuses while the symbol has active orders, but this command carries no `request_id`, so that refusal is dropped with no user-stream event and the API still returned `200` - confirm with `GET /v2/symbols`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MarginModeRequest'
+            example:
+              symbol: BTC-USD
+              marginMode: isolated
+      responses:
+        '200':
+          description: Change sequenced
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MarginModeResponse'
+        '400':
+          description: '`cannot change margin mode while position is open`, `invalid symbol`, binding errors'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /v2/symbols:
+    get:
+      tags:
+      - Trading
+      summary: Get margin mode and leverage settings
+      description: Account defaults plus the effective margin mode and leverage for every listed market. Requires authentication (no public selectors); without it returns `401 account_id not found in auth context`.
+      parameters:
+      - $ref: '#/components/parameters/LeaderVaultIdQuery'
+      - $ref: '#/components/parameters/SubAccountIdQuery'
+      responses:
+        '200':
+          description: Settings
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SymbolSettingsResponse'
+        '400':
+          description: '`vault_id and sub_account_id are mutually exclusive`'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: '`only vault leader can perform this action on vault account`, `sub-account access denied`'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    put:
+      tags:
+      - Trading
+      summary: Bulk-update margin mode and leverage
+      description: |
+        Updates account defaults and any number of symbols in one engine command. Changes that are
+        not allowed right now are skipped silently, per symbol: margin mode with an open position
+        or open orders, a leverage decrease with an open position, leverage above the market max,
+        or a position above the new tier's notional cap. Unknown symbols are ignored. Returns
+        `204` with no body (also when nothing changed). The command carries no `request_id`, so an
+        engine-side refusal (e.g. an order arrived in between) is dropped with no user-stream
+        event - re-read `GET /v2/symbols` to confirm.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateSymbolsRequest'
+            example:
+              default_leverage: 10
+              symbol_settings:
+                BTC-USD:
+                  margin_mode: isolated
+                  leverage: 20
+                ETH-USD:
+                  leverage: 15
+      responses:
+        '204':
+          description: Accepted (no body)
+        '400':
+          description: '`invalid margin mode`, `invalid leverage` (default_leverage out of range), binding errors'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /v2/isoMargin:
+    post:
+      tags:
+      - Trading
+      summary: Add or remove isolated margin
+      description: |
+        Moves margin into (`add`, up to the withdrawable balance) or out of (`remove`, up to
+        `max(0, IsoBalance - max(InitialMargin - UPnL, MaintenanceMargin))`) an isolated position.
+        Engine rejections (`invalid_add_margin`, `invalid_reduce_margin`) arrive on the user
+        stream with `request_id`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ModifyMarginRequest'
+            example:
+              symbol: BTC-USD
+              amount: '100'
+              modify_type: add
+      responses:
+        '200':
+          description: Change sequenced
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModifyMarginResponse'
+        '400':
+          description: '`no position found for symbol`, `position must be in isolated margin mode`, `invalid margin amount`, `invalid symbol`, binding errors'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
   /v2/algo/twap:
     post:
       tags:
       - Algo
-      summary: Create TWAP strategy
+      summary: Create TWAP
       description: |
-        Create a new TWAP (Time-Weighted Average Price) strategy. The strategy splits a large order into smaller slices executed at regular intervals over the specified duration.
-
-        **Constraints:**
-        - `duration_sec`: 300 (5 min) to 86400 (24 hr)
-        - `total_size`: must exceed the market's minimum order size
-        - Per-slice size must exceed the market's minimum order size
-        - Maximum 20 concurrent non-terminal strategies per account
+        Server-side TWAP: the order is split into `nominal_slices = clamp(duration_sec / 30, 5, 120)`
+        market IOC child orders (`client_order_id` = `twap-{strategy_id}-{slice}`). Validation:
+        `duration_sec` 300-86400; `total_size` > 0, rounded down to the market step and >= the
+        market minimum; each slice must meet the market min size and min notional; at most 20
+        `active` + `cancelling` TWAPs per account.
       requestBody:
         required: true
         content:
           application/json:
             schema:
               $ref: '#/components/schemas/CreateTwapRequest'
-            examples:
-              basic_twap:
-                summary: Basic BUY TWAP over 1 hour
-                value:
-                  symbol: BTC-USDT
-                  side: BUY
-                  total_size: '1.5'
-                  duration_sec: 3600
-              twap_with_limit:
-                summary: TWAP with limit price and jitter
-                value:
-                  symbol: BTC-USDT
-                  side: BUY
-                  total_size: '1.5'
-                  duration_sec: 3600
-                  limit_price: '45000.00'
-                  randomize: true
+            example:
+              symbol: BTC-USD
+              side: BUY
+              total_size: '1.5'
+              duration_sec: 3600
+              limit_price: '52000'
+              randomize: true
       responses:
         '201':
           description: Strategy created
@@ -1523,145 +2138,194 @@ paths:
               schema:
                 $ref: '#/components/schemas/CreateTwapResponse'
         '400':
-          description: Invalid request (validation failure)
+          description: Validation failure, prefixed `invalid twap request:`
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
               examples:
-                bad_duration:
+                duration:
                   value:
                     error: 'invalid twap request: duration_sec must be >= 300'
-                bad_size:
+                side:
                   value:
-                    error: 'invalid twap request: total_size must be positive'
+                    error: 'invalid twap request: side must be BUY or SELL, got "buy"'
+                slice:
+                  value:
+                    error: 'invalid twap request: total_size too small for duration — per-slice size below market minimum (per-slice ~0.0001, min 0.001)'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: '`vault not found`'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '409':
-          description: Concurrent strategy limit reached (max 20)
+          description: Concurrent limit reached
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
               example:
-                error: concurrent TWAP limit reached
+                error: twap concurrent limit exceeded
         '503':
-          description: Algo TWAP service not configured
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
+          $ref: '#/components/responses/TwapUnavailable'
     get:
       tags:
       - Algo
-      summary: List TWAP strategies
-      description: List TWAP strategies for the authenticated account. By default returns only active
-        and cancelling strategies.
+      summary: List TWAPs
+      description: |
+        Default (`status` empty or `active`) returns `active` + `cancelling`; `all` includes terminal
+        ones; any other value filters to that exact status. Public reads via `account_id`,
+        `vault_id` or `blockchain_address` omit `last_error`. `scope=all` lists the master and its
+        sub-accounts.
+      security:
+      - ApiWalletAuth: []
+      - {}
       parameters:
       - name: status
         in: query
         required: false
-        description: |
-          Filter by status. Empty or "active" returns active + cancelling strategies. "all" includes terminal statuses. Any other value filters to that specific status.
         schema:
           type: string
           enum:
           - active
           - all
+          - pending
+          - cancelling
           - completed
           - cancelled
           - expired
           - failed
           - liquidated
-        example: active
+      - name: scope
+        in: query
+        required: false
+        schema:
+          type: string
+          enum:
+          - all
+      - $ref: '#/components/parameters/AccountIdQuery'
+      - $ref: '#/components/parameters/VaultIdQuery'
+      - $ref: '#/components/parameters/BlockchainQuery'
+      - $ref: '#/components/parameters/BlockchainAddressQuery'
+      - $ref: '#/components/parameters/SubAccountIdQuery'
       responses:
         '200':
-          description: Successful response
+          description: Strategies, newest first
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  strategies:
-                    type: array
-                    items:
-                      $ref: '#/components/schemas/TwapStrategyView'
-        '401':
-          $ref: '#/components/responses/Unauthorized'
-        '503':
-          description: Algo TWAP service not configured
+                $ref: '#/components/schemas/TwapListResponse'
+        '400':
+          description: '`vault_id and sub_account_id are mutually exclusive`, `invalid scope: only scope=all is supported`, `scope=all cannot be combined with vault_id`, `invalid account_id`, `invalid vault id`'
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: '`sub-account access denied`, `scope=all is not available to sub-account API keys`'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          $ref: '#/components/responses/TwapUnavailable'
   /v2/algo/twap/{id}:
     get:
       tags:
       - Algo
-      summary: Get TWAP strategy
-      description: Fetch details of a single TWAP strategy by ID.
+      summary: Get TWAP
+      security:
+      - ApiWalletAuth: []
+      - {}
       parameters:
       - name: id
         in: path
         required: true
-        description: Strategy ID (UUID)
         schema:
           type: string
-        example: 019681a3-7e00-7000-8000-000000000001
+      - $ref: '#/components/parameters/AccountIdQuery'
+      - $ref: '#/components/parameters/VaultIdQuery'
+      - $ref: '#/components/parameters/BlockchainQuery'
+      - $ref: '#/components/parameters/BlockchainAddressQuery'
+      - $ref: '#/components/parameters/SubAccountIdQuery'
       responses:
         '200':
-          description: Successful response
+          description: Strategy
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/TwapStrategyView'
         '400':
-          description: Missing strategy ID
+          description: '`vault_id and sub_account_id are mutually exclusive`, `invalid account_id`, `invalid vault id`'
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
         '401':
           $ref: '#/components/responses/Unauthorized'
-        '404':
-          $ref: '#/components/responses/NotFound'
-        '503':
-          description: Algo TWAP service not configured
+        '403':
+          description: '`sub-account access denied`'
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '404':
+          description: Not found for this account (`strategy not found`), or `vault not found`
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: strategy not found
+        '503':
+          $ref: '#/components/responses/TwapUnavailable'
     delete:
       tags:
       - Algo
-      summary: Cancel TWAP strategy
-      description: Cancel an active TWAP strategy. The strategy transitions to "cancelling" immediately.
-        The bot-engine finalizes the cancellation asynchronously once any in-flight child order completes.
+      summary: Cancel TWAP
+      description: Moves an `active` strategy to `cancelling`; the TWAP worker finishes any in-flight slice and sets `cancelled`. Use the `vault_id` / `sub_account_id` query parameters for vault or sub-account strategies.
       parameters:
       - name: id
         in: path
         required: true
-        description: Strategy ID (UUID)
         schema:
           type: string
-        example: 019681a3-7e00-7000-8000-000000000001
+      - name: vault_id
+        in: query
+        required: false
+        schema:
+          type: string
+      - name: sub_account_id
+        in: query
+        required: false
+        schema:
+          type: string
       responses:
         '200':
-          description: Cancel request accepted
+          description: Cancel accepted
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/CancelTwapResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '400':
-          description: Missing strategy ID
+          description: '`vault_id and sub_account_id are mutually exclusive`'
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
-        '401':
-          $ref: '#/components/responses/Unauthorized'
         '404':
-          description: Strategy not found or not active
+          description: Unknown, not owned, or not `active` (`strategy not found or not active`); `vault not found`
           content:
             application/json:
               schema:
@@ -1669,287 +2333,4 @@ paths:
               example:
                 error: strategy not found or not active
         '503':
-          description: Algo TWAP service not configured
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-  /v2/history/order:
-    get:
-      tags:
-      - History
-      summary: Get order history
-      description: Query historical orders. Supports filtering by symbol, status, time range, and source.
-        Use source=twap to filter to TWAP child orders. Supports unauthenticated access when account_id
-        or vault_id is provided.
-      parameters:
-      - name: symbol
-        in: query
-        required: false
-        description: Filter by trading pair symbol
-        schema:
-          type: string
-        example: BTC-USDT
-      - name: status
-        in: query
-        required: false
-        description: Filter by order status (numeric enum value)
-        schema:
-          type: string
-      - name: order_id
-        in: query
-        required: false
-        description: Filter by specific order ID
-        schema:
-          type: string
-      - name: startTime
-        in: query
-        required: false
-        description: Start timestamp in milliseconds
-        schema:
-          type: string
-        example: '1713806400000'
-      - name: endTime
-        in: query
-        required: false
-        description: End timestamp in milliseconds
-        schema:
-          type: string
-        example: '1713892800000'
-      - name: limit
-        in: query
-        required: false
-        description: Max results (default 100, max 500)
-        schema:
-          type: string
-        example: '100'
-      - name: fromOrderID
-        in: query
-        required: false
-        description: Pagination cursor — returns orders with ID less than this value
-        schema:
-          type: string
-      - name: source
-        in: query
-        required: false
-        description: Filter by order source. Use "twap" to return only TWAP child orders (matches client_order_id
-          prefix).
-        schema:
-          type: string
-          enum:
-          - twap
-        example: twap
-      - name: account_id
-        in: query
-        required: false
-        description: Account ID for public (unauthenticated) queries
-        schema:
-          type: string
-      - name: vault_id
-        in: query
-        required: false
-        description: Vault ID for public vault queries
-        schema:
-          type: string
-      responses:
-        '200':
-          description: Successful response
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  orders:
-                    type: array
-                    items:
-                      $ref: '#/components/schemas/OrderHistoryEntry'
-                  count:
-                    type: integer
-                    description: Number of orders returned
-                    example: 25
-        '400':
-          $ref: '#/components/responses/InvalidParameter'
-        '401':
-          $ref: '#/components/responses/Unauthorized'
-  /v2/history/fill:
-    get:
-      tags:
-      - History
-      summary: Get fill history
-      description: Query historical fills/trades. Supports filtering by symbol, order, time range, and
-        source. Use source=twap to filter to fills from TWAP child orders. Supports unauthenticated access
-        when account_id or vault_id is provided.
-      parameters:
-      - name: symbol
-        in: query
-        required: false
-        description: Filter by trading pair symbol
-        schema:
-          type: string
-        example: BTC-USDT
-      - name: order_id
-        in: query
-        required: false
-        description: Filter fills from a specific order
-        schema:
-          type: string
-      - name: startTime
-        in: query
-        required: false
-        description: Start timestamp in milliseconds
-        schema:
-          type: string
-        example: '1713806400000'
-      - name: endTime
-        in: query
-        required: false
-        description: End timestamp in milliseconds
-        schema:
-          type: string
-        example: '1713892800000'
-      - name: limit
-        in: query
-        required: false
-        description: Max results (default 500, max 1000)
-        schema:
-          type: string
-        example: '500'
-      - name: fromId
-        in: query
-        required: false
-        description: Backward pagination cursor — returns fills with ID less than this value (descending
-          order)
-        schema:
-          type: string
-      - name: since_trade_id
-        in: query
-        required: false
-        description: Forward pagination cursor — returns fills with trade_id greater than this value (ascending
-          order). Cannot be used with fromId.
-        schema:
-          type: string
-      - name: source
-        in: query
-        required: false
-        description: Filter by order source. Use "twap" to return only fills from TWAP child orders.
-        schema:
-          type: string
-          enum:
-          - twap
-        example: twap
-      - name: account_id
-        in: query
-        required: false
-        description: Account ID for public (unauthenticated) queries
-        schema:
-          type: string
-      - name: vault_id
-        in: query
-        required: false
-        description: Vault ID for public vault queries
-        schema:
-          type: string
-      responses:
-        '200':
-          description: Successful response
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  fills:
-                    type: array
-                    items:
-                      $ref: '#/components/schemas/FillHistoryEntry'
-                  count:
-                    type: integer
-                    description: Number of fills returned
-                    example: 50
-        '400':
-          $ref: '#/components/responses/InvalidParameter'
-        '401':
-          $ref: '#/components/responses/Unauthorized'
-  /v2/leverage:
-    post:
-      tags:
-      - Trading
-      summary: Update leverage
-      description: |
-        Update the leverage for a specific symbol.
-
-        **Note:** This affects new positions only. Existing positions are not modified.
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/LeverageRequest'
-      responses:
-        '200':
-          description: Leverage updated
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/LeverageResponse'
-        '400':
-          $ref: '#/components/responses/InvalidParameter'
-        '401':
-          $ref: '#/components/responses/Unauthorized'
-        '404':
-          $ref: '#/components/responses/NotFound'
-  /v2/marginMode:
-    post:
-      tags:
-      - Trading
-      summary: Update margin mode
-      description: |
-        Switch between cross and isolated margin mode.
-
-        **Note:** Cannot change margin mode while a position is open for the symbol.
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/MarginModeRequest'
-      responses:
-        '200':
-          description: Margin mode updated
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/MarginModeResponse'
-        '400':
-          $ref: '#/components/responses/InvalidParameter'
-        '401':
-          $ref: '#/components/responses/Unauthorized'
-        '404':
-          $ref: '#/components/responses/NotFound'
-  /v2/isoMargin:
-    post:
-      tags:
-      - Trading
-      summary: Modify isolated margin
-      description: |
-        Add or remove margin from an isolated position.
-
-        **Requirements:**
-        - Position must exist and be in isolated margin mode
-        - Cannot remove more margin than available
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/ModifyMarginRequest'
-      responses:
-        '200':
-          description: Margin modification submitted
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ModifyMarginResponse'
-        '400':
-          $ref: '#/components/responses/InvalidParameter'
-        '401':
-          $ref: '#/components/responses/Unauthorized'
+          $ref: '#/components/responses/TwapUnavailable'

@@ -2,32 +2,59 @@ openapi: 3.0.3
 info:
   title: Strike Market Data API
   description: |
-    Public market-data endpoints served by the Price Service.
-    Base path: `/v2`
+    Public market-data endpoints served by the Price Service. No authentication.
+
+    Public base URL: `https://<host>/price` (the gateway strips `/price` before the
+    request reaches the service), so every path below is called as
+    `https://<host>/price/v2/...`, e.g. `https://api.strikefinance.org/price/v2/depth`.
+
+    Conventions:
+    - Send the canonical market symbol, e.g. `BTC-USD`. Most endpoints are
+      case-sensitive (a lowercase symbol gives `400 INVALID_SYMBOL`, or an empty
+      result on `/v2/depth` and `/v2/trades`); `/v2/markPrice` and `/v2/indexPrice`
+      also accept lowercase, and `/v2/sparklines` upper-cases its filter.
+    - Prices, sizes and rates are decimal strings; times are Unix milliseconds (numbers).
+    - Errors are `{"code": "...", "msg": "..."}` (`MISSING_PARAMETER`, `INVALID_PARAMETER`,
+      `INVALID_SYMBOL`, `INTERNAL_ERROR`, `SERVICE_UNAVAILABLE`), except
+      `/v2/marketStats` (400 and 500) and `/v2/sparklines` (500), which return
+      `{"error": "..."}`.
+    - Endpoints served from the in-process short-TTL cache (about 5 s) set
+      `X-Cache: HIT|MISS`.
+
+    Real-time streams are on the public price WebSocket `wss://<host>/ws/price`
+    (see the strike-price-feeds skill). The L3 market-by-order feed is a separate
+    service: `GET https://<host>/v2/l3/snapshot` (documented below with its own
+    `servers`, no `/price` prefix) and `wss://<host>/ws/l3`.
   version: 2.0.0
   contact:
     name: Strike Finance
     url: https://www.strikefinance.org
 servers:
 - url: https://api.strikefinance.org/price
-  description: Mainnet
+  description: Mainnet (paths below are appended, e.g. /price/v2/depth)
 - url: https://api-v2-testnet.strikefinance.org/price
-  description: Testnet
+  description: Testnet (paths below are appended, e.g. /price/v2/depth)
 tags:
 - name: Order Book
   description: Order book depth snapshots
 - name: Trades
-  description: Recent trade data
+  description: Recent public trades
 - name: Prices
-  description: Mark price, index price, and funding rate
+  description: Mark price, index price, premium index and funding
 - name: Ticker
-  description: Rolling statistics, latest price, and best bid/ask
+  description: 24h statistics, latest price, best bid/ask
+- name: Market Stats
+  description: Per-market metadata plus live stats, and the sentiment index
 - name: Exchange Info
   description: Trading rules and symbol information
 - name: Klines
-  description: Candlestick / kline chart data
+  description: Candlestick data and compact sparkline series
 - name: Open Interest
-  description: Open interest data
+  description: Open interest
+- name: Reference Rates
+  description: Stablecoin and fiat reference rates (display only)
+- name: L3
+  description: Market-by-order snapshot (separate L3 service, served without the /price prefix)
 x-tagGroups:
 - name: Market
   tags:
@@ -35,9 +62,12 @@ x-tagGroups:
   - Trades
   - Prices
   - Ticker
+  - Market Stats
   - Exchange Info
   - Klines
   - Open Interest
+  - Reference Rates
+  - L3
 paths:
   /v2/depth:
     get:
@@ -45,60 +75,39 @@ paths:
       - Order Book
       summary: Order Book Depth
       description: |
-        Returns a snapshot of the current order book for a given symbol.
+        Returns the latest order book snapshot for a symbol, read live from the
+        engine's snapshot (not cached, no `X-Cache` header).
 
-        ### Field semantics
+        | Field          | Type       | Description |
+        |----------------|------------|-------------|
+        | `lastUpdateId` | uint64     | Order-book update ID of the snapshot (same ID domain as WS `depthUpdate` `U`/`u` and `bookTicker` `u`). `0` when no snapshot exists. |
+        | `E`            | int64      | Server time when this response was built (ms). |
+        | `T`            | int64      | Time the engine produced the snapshot (ms). |
+        | `bids`         | string[][] | `[price, quantity]`, best (highest) first. |
+        | `asks`         | string[][] | `[price, quantity]`, best (lowest) first. |
 
-        | Field          | Type     | Description |
-        |----------------|----------|-------------|
-        | `lastUpdateId` | uint64   | Monotonically increasing sequence ID assigned by the matching engine (`ctx.SequenceID`). This is a **real update ID**, not a placeholder or timestamp. |
-        | `E`            | int64    | Snapshot event time — Unix milliseconds when the matching engine produced the snapshot. |
-        | `T`            | int64    | Transaction time — same value as `E` for this endpoint. Represents when the orderbook state was captured, **not** the server response time. |
-        | `bids`         | string[][] | Bid levels sorted best (highest) first. Each entry is `[price, quantity]`. |
-        | `asks`         | string[][] | Ask levels sorted best (lowest) first. Each entry is `[price, quantity]`. |
+        An unknown symbol returns `200` with `lastUpdateId: 0` and empty `bids`/`asks`.
 
-        ### Synchronising a local order book with WebSocket
+        ### Using it with the WebSocket `<symbol>@depth` stream
 
-        1. **Initialise** — fetch this endpoint and record `lastUpdateId`.
-        2. **Connect** to the WebSocket stream `{symbol}@depth`.
-        3. **Drop** any WS `depthUpdate` event where `u <= lastUpdateId`.
-        4. **Apply** all subsequent events to update your local book.
-
-        > **Important:** per-symbol `+1` continuity between consecutive `u` values
-        > is **not** guaranteed — the engine may skip IDs when no book change occurs.
-        > Do **not** treat a gap as a missed update.
-
-        ### JS / TS consumers
-
-        `lastUpdateId` (and the WS fields `U` / `u`) can exceed `Number.MAX_SAFE_INTEGER`.
-        Always parse them with a BigInt-safe method:
-
-        ```ts
-        // When parsing the REST response
-        const data = JSON.parse(text, (key, value) => {
-          if (key === "lastUpdateId") return BigInt(value);
-          return value;
-        });
-
-        // When parsing WS depthUpdate messages
-        const msg = JSON.parse(text, (key, value) => {
-          if (key === "U" || key === "u") return BigInt(value);
-          return value;
-        });
-        ```
-
-        ### Caching
-
-        Responses are cached server-side for **5 seconds** (short-TTL).
-        The `X-Cache` response header indicates `HIT` or `MISS`.
+        The WS stream only carries the **top 20 levels per side** as diffs. Seed a
+        local book with `limit=20`, drop buffered WS events with `u <= lastUpdateId`,
+        apply the rest, and treat a level reported as `"0"` as removed (it may only
+        have dropped out of the top 20). `U`/`u` are not contiguous between messages.
+        Diffs are computed against the server's previously published top 20 (the
+        previous WS message), not against this REST snapshot, so periodic re-sync is
+        required for correctness, not only to recover dropped messages.
+        In WS messages `b`/`a` is `null` when that side did not change, and the first
+        message after a symbol gets its first subscriber is the full top 20 with no
+        `"0"` removals, so re-seed from this endpoint after the first WS message.
+        (This REST response always returns arrays for `bids`/`asks`.)
       parameters:
       - name: symbol
         in: query
         required: true
         schema:
           type: string
-        example: BTC-USDT
-        description: Trading pair symbol.
+        example: BTC-USD
       - name: limit
         in: query
         required: false
@@ -107,9 +116,7 @@ paths:
           minimum: 1
           maximum: 1000
           default: 20
-        description: |
-          Maximum number of bid/ask levels to return (each side).
-          Clamped to 1000.
+        description: Levels per side. Values above 1000 are clamped to 1000; non-numeric or <= 0 falls back to 20.
       responses:
         '200':
           description: Order book snapshot
@@ -118,30 +125,34 @@ paths:
               schema:
                 $ref: '#/components/schemas/OrderBookResponse'
               example:
-                lastUpdateId: 1027024
-                E: 1700000000000
-                T: 1700000000000
+                lastUpdateId: 93450741
+                E: 1792438776570
+                T: 1792432626597
                 bids:
-                - - '43250.10'
-                  - '0.500'
-                - - '43250.00'
-                  - '1.200'
+                - - '82.55'
+                  - '1.82'
+                - - '82.5'
+                  - '2.43'
                 asks:
-                - - '43250.20'
-                  - '0.300'
-                - - '43251.00'
-                  - '2.100'
+                - - '82.67'
+                  - '39.31'
+                - - '82.78'
+                  - '50'
         '400':
-          description: Missing or invalid symbol
+          description: Missing symbol
           content:
             application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
               example:
                 code: MISSING_PARAMETER
                 msg: symbol parameter is required
         '500':
-          description: Internal error
+          description: Redis read failed
           content:
             application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
               example:
                 code: INTERNAL_ERROR
                 msg: failed to retrieve orderbook
@@ -150,14 +161,17 @@ paths:
       tags:
       - Trades
       summary: Recent Trades
-      description: Returns the most recent trades for a symbol.
+      description: |
+        Returns the most recent public trades for a symbol, **newest first**. The
+        server keeps the latest 1000 trades per symbol; there is no older paging on
+        this endpoint. Unknown symbols return `[]`. Cached about 5 s (`X-Cache`).
       parameters:
       - name: symbol
         in: query
         required: true
         schema:
           type: string
-        example: BTC-USDT
+        example: BTC-USD
       - name: limit
         in: query
         required: false
@@ -166,10 +180,10 @@ paths:
           minimum: 1
           maximum: 1000
           default: 100
-        description: Number of trades to return. Clamped to 1000.
+        description: Number of trades. Clamped to 1000; non-numeric or <= 0 falls back to 100.
       responses:
         '200':
-          description: List of recent trades
+          description: Recent trades, newest first
           content:
             application/json:
               schema:
@@ -177,42 +191,89 @@ paths:
                 items:
                   $ref: '#/components/schemas/TradeResponse'
               example:
-              - id: 12345
-                price: '43250.10'
-                qty: '0.500'
-                quoteQty: '21625.05'
-                time: 1700000000000
-                isBuyerMaker: false
+              - id: 18071
+                price: '77117.60'
+                qty: '0.0099'
+                quoteQty: '763.464240'
+                time: 1792172831028
+                isBuyerMaker: true
+        '400':
+          description: Missing symbol
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: MISSING_PARAMETER
+                msg: symbol parameter is required
   /v2/premiumIndex:
     get:
       tags:
       - Prices
-      summary: Mark Price / Funding Rate
+      summary: Premium Index / Funding Window
       description: |
-        Returns mark price, index price, and funding rate information.
-        Omit `symbol` to return all symbols.
+        Committed mark and index prices plus statistics of the active funding window.
+        With `symbol` returns one object; without it returns an array for all symbols.
+        Premium-index samples are taken every 5 s; `latestPremiumIndex` is `"0"` until
+        the active window has its first sample.
       parameters:
       - name: symbol
         in: query
         required: false
         schema:
           type: string
-        example: BTC-USDT
+        example: BTC-USD
       responses:
         '200':
-          description: Premium index data
+          description: Premium index data (object for one symbol, array when `symbol` is omitted)
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/PremiumIndexResponse'
+                oneOf:
+                - $ref: '#/components/schemas/PremiumIndexResponse'
+                - type: array
+                  items:
+                    $ref: '#/components/schemas/PremiumIndexResponse'
+              example:
+                symbol: BTC-USD
+                markPrice: '81649.00853590'
+                indexPrice: '81885.03705489'
+                latestPremiumIndex: '0'
+                averagePremiumIndex: '0'
+                premiumIndexCount: 0
+                fundingRate: '0.0000125'
+                nextFundingTime: 1792440000000
+                interestRate: '0.0001'
+                interestRateDampener: '0.0005'
+                fundingMultiplier: '1'
+                time: 1792438625706
+        '400':
+          description: Unknown symbol
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: INVALID_SYMBOL
+                msg: invalid symbol
+        '503':
+          description: Price engine still initializing
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: SERVICE_UNAVAILABLE
+                msg: price engine is initializing
   /v2/markPrice:
     get:
       tags:
       - Prices
       summary: Mark Price
       description: |
-        Returns the current mark price snapshot (same shape as the WS `markPriceUpdate` event).
-        Omit `symbol` to return all symbols.
+        Current mark-price snapshot, same shape as the WS `markPriceUpdate` event.
+        With `symbol` returns one object (cached about 5 s, `X-Cache`); without it
+        returns an array for all symbols (possibly `[]`).
       parameters:
       - name: symbol
         in: query
@@ -222,35 +283,40 @@ paths:
         example: BTC-USD
       responses:
         '200':
-          description: Mark price snapshot
+          description: Mark price snapshot (object, or array when `symbol` is omitted)
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/MarkPriceResponse'
+                oneOf:
+                - $ref: '#/components/schemas/MarkPriceResponse'
+                - type: array
+                  items:
+                    $ref: '#/components/schemas/MarkPriceResponse'
               example:
                 e: markPriceUpdate
-                E: 1700000000000
+                E: 1792438629661
                 s: BTC-USD
-                p: '43250.10'
-                i: '43240.50'
-                P: '43245.00'
-                r: '0.0001'
-                T: 1700003600000
+                p: '81649.00853590'
+                i: '81886.56143616'
+                r: '0.0000125'
+                T: 1792440000000
         '400':
-          description: Invalid symbol
+          description: No mark price data for the symbol
           content:
             application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
               example:
                 code: INVALID_SYMBOL
-                msg: symbol not found
+                msg: no mark price data available for symbol
   /v2/indexPrice:
     get:
       tags:
       - Prices
       summary: Index Price
       description: |
-        Returns the current index price snapshot.
-        Omit `symbol` to return all symbols.
+        Current index-price snapshot. With `symbol` returns one object (cached about
+        5 s, `X-Cache`); without it returns an array for all symbols (possibly `[]`).
       parameters:
       - name: symbol
         in: query
@@ -260,95 +326,302 @@ paths:
         example: BTC-USD
       responses:
         '200':
-          description: Index price snapshot
+          description: Index price snapshot (object, or array when `symbol` is omitted)
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/IndexPriceResponse'
+                oneOf:
+                - $ref: '#/components/schemas/IndexPriceResponse'
+                - type: array
+                  items:
+                    $ref: '#/components/schemas/IndexPriceResponse'
               example:
                 e: indexPriceUpdate
-                E: 1700000000000
+                E: 1792438630601
                 s: BTC-USD
-                p: '43240.50'
+                p: '81885.90564570'
         '400':
-          description: Invalid symbol
+          description: No index price data for the symbol
           content:
             application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
               example:
                 code: INVALID_SYMBOL
-                msg: symbol not found
+                msg: no index price data available for symbol
   /v2/ticker/24hr:
     get:
       tags:
       - Ticker
       summary: 24hr Ticker Statistics
       description: |
-        Returns 24-hour rolling window price change statistics.
-        Omit `symbol` to return all symbols.
+        Rolling 24h statistics built from 1m last-price candles. With `symbol` returns
+        one object (cached about 5 s, `X-Cache`); without it returns an array of only
+        the markets that have 24h candle data. A single-symbol request for a market
+        without 24h data (or an all-markets request when no market has data) falls
+        back to the last price with zero change and zero volume.
+
+        `weightedAvgPrice` is the last price (approximation), `lastQty` is `"0"`, and
+        `firstId`, `lastId`, `count` are always `0`. `openTime` is now minus 24h and
+        `closeTime` is now.
       parameters:
       - name: symbol
         in: query
         required: false
         schema:
           type: string
-        example: BTC-USDT
+        example: BTC-USD
       responses:
         '200':
-          description: 24hr ticker data
+          description: 24hr ticker (object, or array when `symbol` is omitted)
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Ticker24hrResponse'
+                oneOf:
+                - $ref: '#/components/schemas/Ticker24hrResponse'
+                - type: array
+                  items:
+                    $ref: '#/components/schemas/Ticker24hrResponse'
+              example:
+                symbol: BTC-USD
+                priceChange: '-2862.40'
+                priceChangePercent: '-3.578894723680920230'
+                weightedAvgPrice: '77117.60'
+                lastPrice: '77117.60'
+                lastQty: '0'
+                openPrice: '79980'
+                highPrice: '79980'
+                lowPrice: '77117.60'
+                volume: '0.0099'
+                quoteVolume: '763.464240'
+                openTime: 1792352226669
+                closeTime: 1792438626669
+                firstId: 0
+                lastId: 0
+                count: 0
+        '400':
+          description: Unknown symbol
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: INVALID_SYMBOL
+                msg: invalid symbol
   /v2/ticker/price:
     get:
       tags:
       - Ticker
       summary: Latest Price
       description: |
-        Returns the latest price for a symbol.
-        Omit `symbol` to return all symbols.
+        Last traded price from the market record. With `symbol` returns one object;
+        without it returns an array. `time` is the server response time.
       parameters:
       - name: symbol
         in: query
         required: false
         schema:
           type: string
-        example: BTC-USDT
+        example: BTC-USD
       responses:
         '200':
-          description: Latest price
+          description: Latest price (object, or array when `symbol` is omitted)
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TickerPriceResponse'
+                oneOf:
+                - $ref: '#/components/schemas/TickerPriceResponse'
+                - type: array
+                  items:
+                    $ref: '#/components/schemas/TickerPriceResponse'
+              example:
+                symbol: BTC-USD
+                price: '77117.60'
+                time: 1792438627626
+        '400':
+          description: Unknown symbol
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: INVALID_SYMBOL
+                msg: invalid symbol
   /v2/ticker/bookTicker:
     get:
       tags:
       - Ticker
       summary: Best Bid / Ask
       description: |
-        Returns best bid and ask prices and quantities.
-        Omit `symbol` to return all symbols.
+        Best bid/ask price and size from the market record. With `symbol` returns
+        one object; without it returns an array. `time` is the server response time.
+        For a push stream use WS `<symbol>@bookticker`.
       parameters:
       - name: symbol
         in: query
         required: false
         schema:
           type: string
-        example: BTC-USDT
+        example: BTC-USD
       responses:
         '200':
-          description: Book ticker
+          description: Book ticker (object, or array when `symbol` is omitted)
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/BookTickerResponse'
+                oneOf:
+                - $ref: '#/components/schemas/BookTickerResponse'
+                - type: array
+                  items:
+                    $ref: '#/components/schemas/BookTickerResponse'
+              example:
+                symbol: BTC-USD
+                bidPrice: '77117.60'
+                bidQty: '0.0099'
+                askPrice: '80000'
+                askQty: '0.1'
+                time: 1792438628708
+        '400':
+          description: Unknown symbol
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: INVALID_SYMBOL
+                msg: invalid symbol
+  /v2/marketStats:
+    get:
+      tags:
+      - Market Stats
+      summary: Market Stats
+      description: |
+        Market metadata and live stats for every market (sorted by symbol), or one
+        market with `symbol` (exact match). Not cached.
+
+        - `status`: `ACTIVE` (trading), `PRE_TRADING`, `BREAK`, `CLOSED`; `active` and
+          `visibleOnUI` are true only for trading markets.
+        - `category`/`subCategory`: `Crypto`/`""`, or `TradFi` with `FX`, `Commodity`,
+          `Equity` or `Index`.
+        - `collateralAssetName`: the symbol suffix after `-` (e.g. `USD`).
+        - `marketStats.volume24h` is quote volume, `volumeBase24h` base volume.
+        - `marketStats.nextFundingRate` is the **next funding time** in ms (name kept for compatibility).
+        - `marketStats.openInterestBase` is the stored sum of absolute position sizes
+          (long + short, i.e. 2x `/v2/openInterest`); `openInterest` is that value x mark price.
+      parameters:
+      - name: symbol
+        in: query
+        required: false
+        schema:
+          type: string
+        example: BTC-USD
+      responses:
+        '200':
+          description: Market stats envelope
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MarketStatsResponse'
+              example:
+                status: OK
+                data:
+                - symbol: BTC-USD
+                  type: PERPETUAL
+                  category: Crypto
+                  subCategory: ''
+                  assetName: BTC
+                  collateralAssetName: USD
+                  active: true
+                  status: ACTIVE
+                  marketStats:
+                    volume24h: '0'
+                    volumeBase24h: '0'
+                    priceChange24h: '0'
+                    priceChangePercentage24h: '0'
+                    low24h: '77117.60'
+                    high24h: '77117.60'
+                    lastPrice: '77117.60'
+                    markPrice: '81649.00853590'
+                    indexPrice: '81885.93170330'
+                    fundingRate: '0.0000125'
+                    nextFundingRate: 1792440000000
+                    openInterest: '1644224.872173564148'
+                    openInterestBase: '20.13772000000000000'
+                  visibleOnUI: true
+                  createdAt: 0
+        '400':
+          description: Unknown symbol
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorText'
+              example:
+                error: invalid symbol
+        '500':
+          description: Market read failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorText'
+              example:
+                error: failed to retrieve markets
+  /v2/fearGreed:
+    get:
+      tags:
+      - Market Stats
+      summary: Fear & Greed Index
+      description: |
+        Display-only sentiment index (0 = extreme fear, 100 = extreme greed) computed
+        from this exchange's 24h tape and recomputed every 30 s. Sent with
+        `Cache-Control: public, max-age=30`. Not a trading or risk input.
+
+        Classification bands: `< 25` Extreme Fear, `< 45` Fear, `< 55` Neutral,
+        `< 75` Greed, otherwise Extreme Greed. `components` are 0-100 sub-scores
+        (floats rounded to 2 decimals; weights: momentum 0.50, breadth 0.35,
+        volatility 0.15).
+      responses:
+        '200':
+          description: Current reading
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FearGreedResponse'
+              example:
+                status: OK
+                data:
+                  value: 40
+                  classification: Fear
+                  timestamp: 1792438627808
+                  components:
+                    momentum: 50
+                    breadth: 0
+                    volatility: 100
+                  marketsCounted: 1
+        '503':
+          description: No reading computed yet
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: SERVICE_UNAVAILABLE
+                msg: fear and greed index is not available yet
   /v2/exchangeInfo:
     get:
       tags:
       - Exchange Info
       summary: Exchange Information
-      description: Returns trading rules and symbol information for all listed markets.
+      description: |
+        Trading rules for all markets. The response is built once and then served
+        from a non-expiring in-process cache (`X-Cache`), so `serverTime` is the time
+        the cache was filled, not the current time. `rateLimits` is a static list.
+        `quoteAsset` and `marginAsset` are always `USDT` (placeholders; markets are
+        quoted in USD). `status` is the lowercase market status
+        (`pre_trading`, `trading`, `break`, `close`).
+
+        Filters per symbol: `PRICE_FILTER` (`minPrice`, `maxPrice`, `tickSize`),
+        `LOT_SIZE` (limit orders: `minQty`, `maxQty`, `stepSize`), `MARKET_LOT_SIZE`
+        (market orders: `minQty`, `maxQty`, `stepSize`), `MIN_NOTIONAL` (`notional`).
       responses:
         '200':
           description: Exchange info
@@ -356,56 +629,77 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ExchangeInfoResponse'
+        '500':
+          description: Market read failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: INTERNAL_ERROR
+                msg: failed to retrieve exchange information
   /v2/klines:
     get:
       tags:
       - Klines
       summary: Kline / Candlestick Data
       description: |
-        Returns candlestick (OHLCV) bars for a symbol.
+        Candles merged from PostgreSQL (closed history) and Redis (recent and the
+        in-progress candle). Candles are UTC-aligned (`1w` opens Monday 00:00 UTC,
+        `1M` on the 1st, `3d` in day-of-year blocks of 3 that restart each year; the
+        last `3d` block of a year has a `closeTime` past 1 January while the next block
+        opens on 1 January).
 
-        Data is assembled from a cold store (PostgreSQL) and a hot store (Redis).
-        Missing candles between data points are gap-filled with the previous close price and zero volume.
+        ### Window selection
+        - No `startTime`/`endTime`: the newest `limit` candles, ending at the newest
+          stored candle (plus the in-progress candle if it exists). Not forward-filled to now.
+        - `endTime` set (with or without `startTime`): the newest `limit` candles with
+          open time <= `endTime`, gap-filled forward up to `endTime`. Tail-anchored:
+          `startTime` is not a reliable lower bound here, so rows with
+          `openTime < startTime` can appear; drop them if you need a strict bound.
+        - Only `startTime` set: the first `limit` candles from `startTime` forward. If
+          that window is empty, the last candle before `startTime` is returned as a
+          seed, so a row with `openTime < startTime` may appear.
+
+        ### Gap filling and continuity
+        Missing periods between candles are filled with flat candles at the previous
+        close and zero volume. Nothing is synthesized before the market's first candle.
+        For `last`, each closed candle's `open` is set to the previous candle's close
+        (the WebSocket candle's `o` is the period's first trade price instead).
 
         ### Price types
-
-        | `priceType` | Description |
-        |-------------|-------------|
+        | `priceType` | Series |
+        |-------------|--------|
         | `last`      | Last traded price (default). |
-        | `mark`      | Mark price — volume is overlaid from `last` klines. |
-        | `index`     | Index price — volume is overlaid from `last` klines. |
+        | `mark`      | Mark price; volume/trade fields are copied from the `last` candles. |
+        | `index`     | Index price; volume/trade fields are copied from the `last` candles. |
 
-        ### Response format
+        ### Row format (12-element array)
+        | Index | Field         | Type   |
+        |-------|---------------|--------|
+        | 0     | openTime      | int64  |
+        | 1     | open          | string |
+        | 2     | high          | string |
+        | 3     | low           | string |
+        | 4     | close         | string |
+        | 5     | volume (base) | string |
+        | 6     | closeTime     | int64  |
+        | 7     | quoteVolume   | string |
+        | 8     | trades        | int64  |
+        | 9     | "takerBuyBase": despite the name, base volume of trades with `isBuyerMaker=true` (taker sells) | string |
+        | 10    | "takerBuyQuote": quote volume of those trades | string |
+        | 11    | unused, always `"0"` | string |
 
-        Each element is a JSON array (Binance-compatible):
+        True taker-buy volume = `volume - row[9]` (quote: `quoteVolume - row[10]`).
 
-        | Index | Field           | Type   |
-        |-------|-----------------|--------|
-        | 0     | openTime        | int64  |
-        | 1     | open            | string |
-        | 2     | high            | string |
-        | 3     | low             | string |
-        | 4     | close           | string |
-        | 5     | volume          | string |
-        | 6     | closeTime       | int64  |
-        | 7     | quoteVolume     | string |
-        | 8     | trades          | int64  |
-        | 9     | takerBuyBase    | string |
-        | 10    | takerBuyQuote   | string |
-        | 11    | (unused)        | string |
-
-        ### Caching
-
-        Responses are cached server-side for **5 seconds** (short-TTL).
-        The `X-Cache` response header indicates `HIT` or `MISS`.
+        Responses that do not include the in-progress candle are cached about 5 s (`X-Cache`).
       parameters:
       - name: symbol
         in: query
         required: true
         schema:
           type: string
-        example: BTC-USDT
-        description: Trading pair symbol.
+        example: BTC-USD
       - name: interval
         in: query
         required: true
@@ -427,21 +721,21 @@ paths:
           - 3d
           - 1w
           - 1M
-        description: Kline interval.
+        description: Kline interval (case-sensitive; `1M` is one month, `1m` one minute).
       - name: startTime
         in: query
         required: false
         schema:
           type: integer
           format: int64
-        description: Start time in Unix milliseconds (inclusive). Omit to let the server choose.
+        description: Lower bound, Unix ms (inclusive). Only applied as a strict lower bound when `endTime` is omitted, and even then an empty window returns one seed row before it.
       - name: endTime
         in: query
         required: false
         schema:
           type: integer
           format: int64
-        description: End time in Unix milliseconds (inclusive). Omit to return up to the latest candle.
+        description: Upper bound on candle open time, Unix ms (inclusive).
       - name: limit
         in: query
         required: false
@@ -450,7 +744,7 @@ paths:
           minimum: 1
           maximum: 1500
           default: 500
-        description: Maximum number of candles to return. Clamped to 1500.
+        description: Max candles. Clamped to 1500; non-numeric or <= 0 falls back to 500.
       - name: priceType
         in: query
         required: false
@@ -461,120 +755,454 @@ paths:
           - mark
           - index
           default: last
-        description: |
-          Price series to use.
-          `mark` and `index` klines overlay volume from `last` klines.
       responses:
         '200':
-          description: Array of kline bars
+          description: Array of kline rows, oldest first
           content:
             application/json:
               schema:
                 type: array
                 items:
-                  type: array
-                  items: {}
-                  minItems: 12
-                  maxItems: 12
-                description: 'Each element is a 12-element array: [openTime, open, high, low, close, volume,
-                  closeTime, quoteVolume, trades, takerBuyBase, takerBuyQuote, "0"].'
+                  $ref: '#/components/schemas/Kline'
               example:
-              - - 1700000000000
-                - '43250.10'
-                - '43300.00'
-                - '43200.50'
-                - '43280.00'
-                - '125.340'
-                - 1700000059999
-                - '5421750.00'
-                - 312
-                - '62.170'
-                - '2690125.00'
+              - - 1792170000000
+                - '79980'
+                - '79980'
+                - '77117.60'
+                - '77117.60'
+                - '0.0099'
+                - 1792173599999
+                - '763.464240'
+                - 1
+                - '0.0099'
+                - '763.464240'
                 - '0'
         '400':
           description: Missing or invalid parameter
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  code:
-                    type: string
-                    example: MISSING_PARAMETER
-                  msg:
-                    type: string
-                    example: symbol parameter is required
+                $ref: '#/components/schemas/Error'
+              examples:
+                missingSymbol:
+                  value:
+                    code: MISSING_PARAMETER
+                    msg: symbol parameter is required
+                missingInterval:
+                  value:
+                    code: MISSING_PARAMETER
+                    msg: interval parameter is required
+                badInterval:
+                  value:
+                    code: INVALID_PARAMETER
+                    msg: invalid interval
+                badStart:
+                  value:
+                    code: INVALID_PARAMETER
+                    msg: invalid startTime
+                badEnd:
+                  value:
+                    code: INVALID_PARAMETER
+                    msg: invalid endTime
+                badPriceType:
+                  value:
+                    code: INVALID_PARAMETER
+                    msg: priceType must be 'last', 'mark', or 'index'
+        '500':
+          description: Storage read failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: INTERNAL_ERROR
+  /v2/sparklines:
+    get:
+      tags:
+      - Klines
+      summary: Sparklines
+      description: |
+        Trailing close-price series for every **trading** market in one call (for list
+        UIs). Served only from Redis, sent with `Cache-Control: public, max-age=30`,
+        cached about 5 s (`X-Cache`).
+
+        **Only `priceType=last` returns data today.** Closed mark/index candles for these
+        intervals are moved to PostgreSQL and removed from Redis by the klines worker,
+        so `mark`/`index` (including the default) return `data: {}`; use
+        `/v2/klines?priceType=mark` for mark-price mini charts.
+
+        Each entry holds up to `points` closes, oldest first; `openTime` is the open
+        time of the first close. Redis keeps roughly the 24h before each market's
+        newest candle (not before now), so an idle market's series can be old. Only
+        candles with trades are stored, so a `last` series skips idle periods and is
+        not evenly spaced. Markets with no candles are omitted.
+      parameters:
+      - name: interval
+        in: query
+        required: false
+        schema:
+          type: string
+          enum:
+          - 5m
+          - 15m
+          - 30m
+          - 1h
+          - 2h
+          - 4h
+          default: 1h
+      - name: points
+        in: query
+        required: false
+        schema:
+          type: integer
+          minimum: 2
+          maximum: 288
+          default: 24
+        description: Closes per market. Values below 2 are rejected; values above 288 are clamped.
+      - name: priceType
+        in: query
+        required: false
+        schema:
+          type: string
+          enum:
+          - last
+          - mark
+          - index
+          default: mark
+        description: Use `last`; `mark`/`index` (and the default) currently return empty `data`. Other values → 400 INVALID_PARAMETER.
+      - name: symbol
+        in: query
+        required: false
+        schema:
+          type: string
+        example: BTC-USD,ETH-USD
+        description: Optional comma-separated filter (trimmed, upper-cased, de-duplicated).
+      responses:
+        '200':
+          description: Sparkline envelope
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SparklinesResponse'
+              example:
+                status: OK
+                interval: 1h
+                priceType: last
+                points: 5
+                data:
+                  BTC-USD:
+                    openTime: 1792116000000
+                    closes:
+                    - '80000.0'
+                    - '79980'
+                    - '77117.60'
+        '400':
+          description: Invalid parameter
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                badInterval:
+                  value:
+                    code: INVALID_PARAMETER
+                    msg: interval must be one of 5m, 15m, 30m, 1h, 2h, 4h
+                badPoints:
+                  value:
+                    code: INVALID_PARAMETER
+                    msg: points must be an integer >= 2
+        '500':
+          description: Read failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorText'
+              example:
+                error: failed to retrieve sparklines
   /v2/openInterest:
     get:
       tags:
       - Open Interest
       summary: Open Interest
       description: |
-        Returns current open interest in base-asset units.
-        Omit `symbol` to return all symbols.
+        One-sided open interest in base-asset units (the stored sum of absolute
+        position sizes divided by 2). With `symbol` returns one object; without it
+        returns an array for all markets. A market with no stored value reports `"0"`.
+        `time` is the server response time.
       parameters:
       - name: symbol
         in: query
         required: false
         schema:
           type: string
-        example: BTCUSD
+        example: BTC-USD
       responses:
         '200':
-          description: Open interest data
+          description: Open interest (object, or array when `symbol` is omitted)
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/OpenInterestResponse'
+                oneOf:
+                - $ref: '#/components/schemas/OpenInterestResponse'
+                - type: array
+                  items:
+                    $ref: '#/components/schemas/OpenInterestResponse'
+              example:
+                symbol: BTC-USD
+                openInterest: '10.06886000000000000'
+                time: 1792438631552
+        '400':
+          description: Unknown symbol
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: INVALID_SYMBOL
+                msg: invalid symbol
+  /v2/stablecoin/rates:
+    get:
+      tags:
+      - Reference Rates
+      summary: Stablecoin Rates
+      description: |
+        Current USD prices of stablecoin and stable-price symbols tracked by the price
+        engine, as a map of symbol to decimal string. Only positive prices are included.
+        Keys vary by deployment and are mixed-case (testnet also has `USDCx-USD`,
+        `USDrf-USD`, `IUSD-USD`); do not hard-code the set.
+      responses:
+        '200':
+          description: Map of symbol to USD price
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StablecoinRatesResponse'
+              example:
+                USDC-USD: '0.99993125'
+                USDT-USD: '0.9988746153846153846'
+                USDM-USD: '1.000191116472927282'
+                DEPOSIT-USDM-USD: '0.9974966573897500'
+                WITHDRAW-USDM-USD: '1.000191116472927282'
+  /v2/fxRates:
+    get:
+      tags:
+      - Reference Rates
+      summary: Fiat FX Rates
+      description: |
+        Display-only USD to fiat reference rates (daily ECB reference rates). `rates`
+        are units of each currency per 1 USD and always include `USD: "1"` in the
+        unfiltered response. `date` is the upstream publication date (lags on weekends
+        and holidays); `updatedAt` is when the service last read the upstream.
+        Sent with `Cache-Control: public, max-age=300`. A requested code the upstream
+        does not publish is simply absent.
+      parameters:
+      - name: symbols
+        in: query
+        required: false
+        schema:
+          type: string
+        example: EUR,JPY
+        description: Optional comma-separated 3-letter currency codes (case-insensitive).
+      responses:
+        '200':
+          description: FX rates
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FXRatesResponse'
+              example:
+                status: OK
+                base: USD
+                date: '2026-10-19'
+                updatedAt: 1792438597842
+                rates:
+                  EUR: '0.89087'
+                  JPY: '158.24'
+        '400':
+          description: Malformed currency code
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: INVALID_PARAMETER
+                msg: '"EURO" is not a 3-letter currency code'
+        '503':
+          description: Rates not loaded yet
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: SERVICE_UNAVAILABLE
+                msg: fx rates are not available yet
+  /v2/l3/snapshot:
+    servers:
+    - url: https://api.strikefinance.org
+      description: Mainnet (no /price prefix)
+    - url: https://api-v2-testnet.strikefinance.org
+      description: Testnet (no /price prefix)
+    get:
+      tags:
+      - L3
+      summary: L3 Order Book Snapshot
+      description: |
+        Every visible resting order for one symbol at one coherent sequence. Served by
+        the L3 service directly on the API host: `https://<host>/v2/l3/snapshot`.
+        The real-time feed is `wss://<host>/ws/l3`, stream `<symbol>@l3` (see the
+        strike-orderbook skill for the update events and bootstrap rules).
+
+        - Only allowlisted symbols are served (currently `BTC-USD`); `symbol` is
+          trimmed and upper-cased.
+        - Complete book, never truncated or paginated. Bids descending, asks
+          ascending, orders within a level in FIFO priority. A level's `price` text is
+          its first order's spelling (equal prices can differ in trailing zeros).
+        - `last_sequence` is in the same per-symbol domain as WS `l3_update.sequence`;
+          apply updates with `sequence > last_sequence`, each exactly previous + 1.
+        - `timestamp` is the server time of the read.
+        - Limits: 10 requests/s per source IP, shared with `/ws/l3` handshakes.
+      parameters:
+      - name: symbol
+        in: query
+        required: true
+        schema:
+          type: string
+        example: BTC-USD
+      responses:
+        '200':
+          description: Complete L3 snapshot
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/L3Snapshot'
+              example:
+                type: l3_snapshot
+                symbol: BTC-USD
+                last_sequence: 11197
+                timestamp: 1792438895126
+                bids:
+                - price: '72247.30'
+                  orders:
+                  - order_id: 9Ix5zep5IpZafACmP1p_3Q
+                    size: '0.01107'
+                - price: '72178.80'
+                  orders:
+                  - order_id: OKIEOZ727YYzn5Cy8JOxGA
+                    size: '0.01108'
+                asks: []
+        '400':
+          description: Unsupported or missing symbol, or unparseable client IP
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorText'
+              examples:
+                badSymbol:
+                  value:
+                    error: unsupported or missing symbol
+                badIP:
+                  value:
+                    error: invalid client IP
+        '403':
+          description: Request reached the service on a host other than the API or DMA host
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorText'
+              example:
+                error: L3 is unavailable on this host
+        '429':
+          description: Per-IP request limit exceeded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorText'
+              example:
+                error: L3 request limit exceeded
+        '503':
+          description: L3 state not ready, publisher down, or rate limiter unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorText'
+              examples:
+                notReady:
+                  value:
+                    error: L3 snapshot unavailable
+                limiter:
+                  value:
+                    error: L3 request limit unavailable
 components:
   schemas:
+    Error:
+      type: object
+      properties:
+        code:
+          type: string
+          enum:
+          - MISSING_PARAMETER
+          - INVALID_PARAMETER
+          - INVALID_SYMBOL
+          - INTERNAL_ERROR
+          - SERVICE_UNAVAILABLE
+        msg:
+          type: string
+    ErrorText:
+      type: object
+      properties:
+        error:
+          type: string
     OrderBookResponse:
       type: object
       properties:
         lastUpdateId:
           type: integer
           format: uint64
-          description: Engine sequence ID. Monotonically increasing, **not** a timestamp.
+          description: Order-book update ID of the snapshot; 0 when no snapshot exists.
         E:
           type: integer
           format: int64
-          description: Snapshot event time (Unix ms).
+          description: Server response time (Unix ms).
         T:
           type: integer
           format: int64
-          description: Transaction time (Unix ms). Same value as `E` on this endpoint.
+          description: Snapshot time from the engine (Unix ms).
         bids:
           type: array
           items:
             type: array
             items:
               type: string
-          description: 'Bid levels, best first. Each entry: `[price, quantity]`.'
+          description: '`[price, quantity]`, highest price first.'
         asks:
           type: array
           items:
             type: array
             items:
               type: string
-          description: 'Ask levels, best first. Each entry: `[price, quantity]`.'
+          description: '`[price, quantity]`, lowest price first.'
     TradeResponse:
       type: object
       properties:
         id:
           type: integer
           format: int64
+          description: Trade ID (same as WS `trade.t`).
         price:
           type: string
         qty:
           type: string
+          description: Base quantity.
         quoteQty:
           type: string
+          description: price x qty.
         time:
           type: integer
           format: int64
-          description: Trade timestamp (Unix ms).
+          description: Trade time (Unix ms).
         isBuyerMaker:
           type: boolean
+          description: true when the buyer was the maker (sell-side taker).
     PremiumIndexResponse:
       type: object
       properties:
@@ -584,18 +1212,72 @@ components:
           type: string
         indexPrice:
           type: string
-        estimatedSettlePrice:
+        latestPremiumIndex:
           type: string
-        lastFundingRate:
+          description: Latest premium-index sample in the active funding window ("0" before the first sample).
+        averagePremiumIndex:
           type: string
+          description: Average of the samples in the active window.
+        premiumIndexCount:
+          type: integer
+          description: Number of samples in the active window.
+        fundingRate:
+          type: string
+          description: Funding rate estimated from the active window.
         nextFundingTime:
           type: integer
           format: int64
         interestRate:
           type: string
+        interestRateDampener:
+          type: string
+        fundingMultiplier:
+          type: string
         time:
           type: integer
           format: int64
+    MarkPriceResponse:
+      type: object
+      properties:
+        e:
+          type: string
+          enum:
+          - markPriceUpdate
+        E:
+          type: integer
+          format: int64
+          description: Event time (Unix ms).
+        s:
+          type: string
+          description: Symbol.
+        p:
+          type: string
+          description: Mark price.
+        i:
+          type: string
+          description: Index price.
+        r:
+          type: string
+          description: Funding rate.
+        T:
+          type: integer
+          format: int64
+          description: Next funding time (Unix ms).
+    IndexPriceResponse:
+      type: object
+      properties:
+        e:
+          type: string
+          enum:
+          - indexPriceUpdate
+        E:
+          type: integer
+          format: int64
+        s:
+          type: string
+        p:
+          type: string
+          description: Index price.
     Ticker24hrResponse:
       type: object
       properties:
@@ -607,10 +1289,12 @@ components:
           type: string
         weightedAvgPrice:
           type: string
+          description: Equals lastPrice (approximation).
         lastPrice:
           type: string
         lastQty:
           type: string
+          description: Always "0".
         openPrice:
           type: string
         highPrice:
@@ -619,8 +1303,10 @@ components:
           type: string
         volume:
           type: string
+          description: 24h base volume.
         quoteVolume:
           type: string
+          description: 24h quote volume.
         openTime:
           type: integer
           format: int64
@@ -630,12 +1316,15 @@ components:
         firstId:
           type: integer
           format: int64
+          description: Always 0.
         lastId:
           type: integer
           format: int64
+          description: Always 0.
         count:
           type: integer
           format: int64
+          description: Always 0.
     TickerPriceResponse:
       type: object
       properties:
@@ -662,14 +1351,141 @@ components:
         time:
           type: integer
           format: int64
+    MarketStatsResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          enum:
+          - OK
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/MarketStatsItem'
+    MarketStatsItem:
+      type: object
+      properties:
+        symbol:
+          type: string
+        type:
+          type: string
+          enum:
+          - PERPETUAL
+        category:
+          type: string
+          enum:
+          - Crypto
+          - TradFi
+        subCategory:
+          type: string
+          enum:
+          - ''
+          - FX
+          - Commodity
+          - Equity
+          - Index
+        assetName:
+          type: string
+        collateralAssetName:
+          type: string
+        active:
+          type: boolean
+        status:
+          type: string
+          enum:
+          - ACTIVE
+          - PRE_TRADING
+          - BREAK
+          - CLOSED
+        marketStats:
+          $ref: '#/components/schemas/MarketStatsSnapshot'
+        visibleOnUI:
+          type: boolean
+        createdAt:
+          type: integer
+          format: int64
+    MarketStatsSnapshot:
+      type: object
+      properties:
+        volume24h:
+          type: string
+          description: 24h quote volume.
+        volumeBase24h:
+          type: string
+        priceChange24h:
+          type: string
+        priceChangePercentage24h:
+          type: string
+        low24h:
+          type: string
+        high24h:
+          type: string
+        lastPrice:
+          type: string
+        markPrice:
+          type: string
+        indexPrice:
+          type: string
+        fundingRate:
+          type: string
+        nextFundingRate:
+          type: integer
+          format: int64
+          description: Next funding TIME (Unix ms), despite the name.
+        openInterest:
+          type: string
+          description: openInterestBase x markPrice (USD).
+        openInterestBase:
+          type: string
+          description: Sum of absolute position sizes (long + short), base units.
+    FearGreedResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          enum:
+          - OK
+        data:
+          type: object
+          properties:
+            value:
+              type: integer
+              minimum: 0
+              maximum: 100
+            classification:
+              type: string
+              enum:
+              - Extreme Fear
+              - Fear
+              - Neutral
+              - Greed
+              - Extreme Greed
+            timestamp:
+              type: integer
+              format: int64
+              description: When the reading was computed (Unix ms).
+            components:
+              type: object
+              properties:
+                momentum:
+                  type: number
+                breadth:
+                  type: number
+                volatility:
+                  type: number
+            marketsCounted:
+              type: integer
     ExchangeInfoResponse:
       type: object
       properties:
         timezone:
           type: string
+          enum:
+          - UTC
         serverTime:
           type: integer
           format: int64
+          description: Time the cached response was built (not the current time).
         rateLimits:
           type: array
           items:
@@ -680,6 +1496,7 @@ components:
             $ref: '#/components/schemas/SymbolInfo'
     RateLimit:
       type: object
+      description: Static list (REQUEST_WEIGHT 2400/min, ORDERS 1200/min).
       properties:
         rateLimitType:
           type: string
@@ -696,17 +1513,26 @@ components:
           type: string
         pair:
           type: string
+          description: Same as symbol.
         contractType:
           type: string
-          example: PERPETUAL
+          enum:
+          - PERPETUAL
         status:
           type: string
+          enum:
+          - pre_trading
+          - trading
+          - break
+          - close
         baseAsset:
           type: string
         quoteAsset:
           type: string
+          description: Always "USDT" (placeholder).
         marginAsset:
           type: string
+          description: Always "USDT" (placeholder).
         pricePrecision:
           type: integer
         quantityPrecision:
@@ -717,6 +1543,8 @@ components:
           type: integer
         underlyingType:
           type: string
+          enum:
+          - COIN
         underlyingSubType:
           type: array
           items:
@@ -727,10 +1555,13 @@ components:
           type: string
         liquidationFee:
           type: string
+          description: Liquidation fee rate.
         limitTakeBound:
           type: string
+          description: Limit-order price bound.
         marketTakeBound:
           type: string
+          description: Market-order price bound.
         filters:
           type: array
           items:
@@ -739,15 +1570,23 @@ components:
           type: array
           items:
             type: string
+          description: Static list LIMIT, MARKET, STOP, STOP_MARKET, TAKE_PROFIT, TAKE_PROFIT_MARKET.
         timeInForce:
           type: array
           items:
             type: string
+          description: Static list GTC, IOC, FOK.
     FilterInfo:
       type: object
+      description: Only the fields relevant to `filterType` are present.
       properties:
         filterType:
           type: string
+          enum:
+          - PRICE_FILTER
+          - LOT_SIZE
+          - MARKET_LOT_SIZE
+          - MIN_NOTIONAL
         maxPrice:
           type: string
         minPrice:
@@ -760,61 +1599,48 @@ components:
           type: string
         stepSize:
           type: string
-        limit:
-          type: integer
         notional:
           type: string
-        multiplierUp:
-          type: string
-        multiplierDown:
-          type: string
-        multiplierDecimal:
-          type: string
-    MarkPriceResponse:
+    Kline:
+      type: array
+      description: '[openTime, open, high, low, close, volume, closeTime, quoteVolume, trades, takerBuyBase, takerBuyQuote, "0"]'
+      minItems: 12
+      maxItems: 12
+      items:
+        oneOf:
+        - type: integer
+          format: int64
+        - type: string
+    SparklinesResponse:
       type: object
       properties:
-        e:
+        status:
           type: string
-          description: Event type (`markPriceUpdate`).
-        E:
+          enum:
+          - OK
+        interval:
+          type: string
+        priceType:
+          type: string
+        points:
           type: integer
-          format: int64
-          description: Event time (Unix ms).
-        s:
-          type: string
-          description: Symbol.
-        p:
-          type: string
-          description: Mark price.
-        i:
-          type: string
-          description: Index price.
-        P:
-          type: string
-          description: Estimated settle price.
-        r:
-          type: string
-          description: Funding rate.
-        T:
-          type: integer
-          format: int64
-          description: Next funding time (Unix ms).
-    IndexPriceResponse:
+          description: Effective points after clamping.
+        data:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/SparklineEntry'
+    SparklineEntry:
       type: object
       properties:
-        e:
-          type: string
-          description: Event type (`indexPriceUpdate`).
-        E:
+        openTime:
           type: integer
           format: int64
-          description: Event time (Unix ms).
-        s:
-          type: string
-          description: Symbol.
-        p:
-          type: string
-          description: Index price.
+          description: Open time of the first close.
+        closes:
+          type: array
+          items:
+            type: string
+          description: Close prices, oldest first (may be fewer than requested).
     OpenInterestResponse:
       type: object
       properties:
@@ -822,7 +1648,72 @@ components:
           type: string
         openInterest:
           type: string
-          description: Open interest in base-asset units.
+          description: One-sided open interest, base-asset units.
         time:
           type: integer
           format: int64
+    StablecoinRatesResponse:
+      type: object
+      additionalProperties:
+        type: string
+      description: Symbol (e.g. USDC-USD) to USD price.
+    FXRatesResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          enum:
+          - OK
+        base:
+          type: string
+          enum:
+          - USD
+        date:
+          type: string
+          description: Upstream publication date (YYYY-MM-DD).
+        updatedAt:
+          type: integer
+          format: int64
+        rates:
+          type: object
+          additionalProperties:
+            type: string
+    L3Snapshot:
+      type: object
+      properties:
+        type:
+          type: string
+          enum:
+          - l3_snapshot
+        symbol:
+          type: string
+        last_sequence:
+          type: integer
+          format: uint64
+        timestamp:
+          type: integer
+          format: int64
+        bids:
+          type: array
+          items:
+            $ref: '#/components/schemas/L3PriceLevel'
+        asks:
+          type: array
+          items:
+            $ref: '#/components/schemas/L3PriceLevel'
+    L3PriceLevel:
+      type: object
+      properties:
+        price:
+          type: string
+        orders:
+          type: array
+          items:
+            type: object
+            properties:
+              order_id:
+                type: string
+                description: Opaque 22-character base64url ID, stable for the order's lifetime.
+              size:
+                type: string
+                description: Remaining size.
