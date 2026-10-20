@@ -109,7 +109,8 @@ components:
         sub-account approved the builder. Applied on `POST /v2/order`, `/v2/orders/batch`,
         `/v2/orders/replace`, `/v2/order/replace-batch` and `/v2/order/strategy` (all legs).
         `POST /v2/order/replace` ignores it: the replacement order carries no builder code at all
-        (no builder fee, no builder attribution).
+        (no builder fee, no builder attribution). `POST /v2/algo/twap` ignores it too: TWAP child
+        orders never carry a builder code.
       schema:
         type: integer
         minimum: 0

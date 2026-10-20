@@ -166,7 +166,7 @@ Check `data.event_type` first; if absent, `data.e` tells you which variant it is
 ```
 
 - `B[0].wb` is the new wallet balance (`cw` repeats it; `bc` is always `"0"`).
-- `r` is the engine reason: `FILL`, `FUNDING`, `DEPOSIT`, `WITHDRAWAL`, `ADL`, `LIQUIDATION_FEE`, `MARGIN_ADJUST`, `LEVERAGE_CHANGE`, `INTERNAL_TRANSFER_IN`, `INTERNAL_TRANSFER_OUT`, `VAULT_DEPOSIT`, `VAULT_WITHDRAWAL`, reward/staking reasons, and others.
+- `r` is the engine reason: `FILL`, `FUNDING`, `DEPOSIT`, `WITHDRAWAL`, `ADL`, `LIQUIDATION_FEE`, `MARGIN_ADJUST`, `LEVERAGE_CHANGE`, `INTERNAL_TRANSFER_IN`, `INTERNAL_TRANSFER_OUT`, vault reasons (your account: `VAULT_CREATE`, `VAULT_DEPOSIT`, `VAULT_DEPOSIT_FROM_STAKING`, `VAULT_WITHDRAWAL`; the vault account: `VAULT_CREATE_RECEIVED`, `VAULT_DEPOSIT_RECEIVED`, `VAULT_WITHDRAWAL_EXECUTED`), reward/staking reasons, and others.
 - `data.e` maps `FILL` -> `ORDER`, `FUNDING` -> `FUNDING`, `DEPOSIT` -> `DEPOSIT`, `WITHDRAWAL` -> `WITHDRAW`, anything else -> `ACCOUNT_UPDATE`.
 - Optional: `staking_reward_balance`, `locked_reward_credit` (only when changed; keep the last value otherwise); inventory fields `custody_balances` and `inventory_costs_usd` (maps of asset -> decimal string), `conversion_reserved_usd` (string) and `slp_adl` (ADL profile view), present only on events that change an account's collateral inventory (vault/SLP accounts).
 
@@ -207,12 +207,12 @@ Check `data.event_type` first; if absent, `data.e` tells you which variant it is
 |--------------|--------------|
 | `LEVERAGE_UPDATED`, `LEVERAGE_UPDATE_FAILED` | `request_id`, `account_id`, `symbol`, `leverage`, `requested_leverage`, `current_leverage`, `error`, `timestamp` (optional fields omitted when empty) |
 | `MARGIN_UPDATED`, `MARGIN_UPDATE_FAILED` | `request_id`, `account_id`, `symbol`, `modify_type` (`add`\|`remove`), `amount`, `isolated_margin`, `error`, `timestamp` |
-| `INTERNAL_TRANSFER_COMPLETED`, `INTERNAL_TRANSFER_FAILED` | `transfer_id`, `account_id`, `transfer_kind`, `recipient_type`, `recipient_address`, `amount`, `error`, `timestamp` |
+| `INTERNAL_TRANSFER_COMPLETED`, `INTERNAL_TRANSFER_FAILED` | `transfer_id`, `account_id`, `transfer_kind`, `recipient_type`, `recipient_address`, `amount`, `error`, `timestamp`. Copy trading uses these: profit shares `recipient_type: "copy_profit_share"`, managed portfolio `copy_portfolio_funding` / `copy_portfolio_refund` (see **strike-copy-trading**) |
 | `STAKING_REWARD_CLAIM_FAILED` | `account_id`, `request_id`, `error`, `timestamp` (success is a plain balance update with `r: "STAKING_REWARD_CLAIM"`) |
-| `VAULT_*` (e.g. `VAULT_DEPOSITED`, `VAULT_WITHDRAWAL_REQUESTED`, `VAULT_WITHDRAWAL_EXECUTED`, `VAULT_LIQUIDATION_INCOME`) | vault event details |
+| `VAULT_*` (e.g. `VAULT_DEPOSITED`, `VAULT_WITHDRAWAL_REQUESTED`, `VAULT_WITHDRAWAL_EXECUTED`, `VAULT_LEADER_FEE_EARNED`, `*_FAILED`, `VAULT_CREATED`, `VAULT_LIQUIDATION_INCOME`) | Delivered to the stream of `event_data.account_id`: depositor/leader events to that account, `VAULT_CREATED` and `VAULT_LIQUIDATION_INCOME` to the vault's own stream. Field lists: **strike-vaults** |
 | `CREDIT_*` | customer-safe credit events |
 
-Use `request_id` to match `LEVERAGE_*` / `MARGIN_*` outcomes to your REST calls.
+Use `request_id` to match `LEVERAGE_*` / `MARGIN_*` outcomes to your REST calls. Copy trading has no dedicated stream event: copied orders/fills/positions arrive as ordinary `ORDER_TRADE_UPDATE` (`c` starts with `copy:`) and `ACCOUNT_UPDATE` messages on the follower account; poll the copy REST routes for subscription state.
 
 ## strategyUpdate
 
@@ -229,13 +229,15 @@ Use `request_id` to match `LEVERAGE_*` / `MARGIN_*` outcomes to your REST calls.
 }
 ```
 
-**Grid bot** (`E` = event time): `data.event_type` is `GRID_BOT_STARTED`, `GRID_BOT_FILL`, `GRID_BOT_FAILED` or `GRID_BOT_STOPPED`, with `account_id`, `bot_id`, `symbol`, `timestamp` and, when relevant, `strategy_id`, `side` (`buy`|`sell`), `size`, `entry_price`, `fill_price`, `realized_pnl`, `fee`, `entry_fee`, `close_type` (`take_profit`, `stop_loss`, `unknown`, or an auto-close type), `partial`, `initialization_mode`, `seed_filled_size`, `seed_average_fill_price`, `seeded_levels`, `resting_entries`, `status`, `error`.
+**Grid bot** (`E` = event time; full lifecycle in **strike-grid-bot**): `data.event_type` is `GRID_BOT_STARTED`, `GRID_BOT_FILL`, `GRID_BOT_FAILED` or `GRID_BOT_STOPPED`, with `account_id`, `bot_id`, `symbol`, `timestamp` and, when relevant, `strategy_id`, `side` (`buy`|`sell`), `size`, `entry_price`, `fill_price`, `realized_pnl`, `fee`, `entry_fee`, `close_type` (`take_profit`, `stop_loss`, `unknown`, or an auto-close type), `partial`, `initialization_mode`, `seed_filled_size`, `seed_average_fill_price`, `seeded_levels`, `resting_entries`, `status`, `error`. Zero decimals, `false` and `0` are omitted (default them to `"0"`/`false`). `GRID_BOT_FILL` is emitted for exit (take-profit/stop-loss) fills only; entry fills produce just the normal `ORDER_TRADE_UPDATE` with the grid client order ID.
 
 Distinguish them by `data.event_type` (grid) vs `data.status` + `data.strategy_id` (TWAP).
 
 ## RFQ
 
-**Requester updates** arrive on your own authenticated `userstream` subscription (never on public vault subscriptions). Best effort -- REST `GET /v2/rfq/{rfq_id}` is authoritative; apply only higher `revision`s.
+REST lifecycle, limits and quoter responses: **strike-rfq**.
+
+**Requester updates** arrive on authenticated `userstream` subscriptions of the requesting account (your own account, or an owned sub-account subscribed via `sub_account_id`). RFQs created with `vault_id` never produce `rfqUpdate` (vault subscriptions are public). No event fires when an RFQ expires -- expire it locally at `expires_at_ms`. Best effort -- REST `GET /v2/rfq/{rfq_id}` is authoritative; apply only higher `revision`s.
 
 ```json
 {
@@ -251,12 +253,12 @@ Distinguish them by `data.event_type` (grid) vs `data.status` + `data.strategy_i
 
 `E` equals `data.updated_at_ms`. `status`: `opened`, `quoted`, `closed` (`closed_at_ms` only when closed). Optional `side`: `buy`|`sell`.
 
-**Quoter feed** (accounts on Strike's quoter allowlist only): on a dedicated socket, after `session.logon`, send exactly `{"method":"subscribe","channel":"rfq","id":1}` (no other fields) -> `{"result":null,"id":1}`. The socket then becomes RFQ-only (ordinary subscriptions are rejected). Events are raw JSON without the `e`/`E` envelope, one per frame:
+**Quoter feed** (accounts on Strike's quoter allowlist only): on a dedicated socket, after `session.logon`, send exactly `{"method":"subscribe","channel":"rfq","id":1}` (exactly these three fields; `id` must be an integer) -> `{"result":null,"id":1}`. Unsubscribe with `{"method":"unsubscribe","channel":"rfq","id":2}`. The socket becomes RFQ-only and stays so after unsubscribe (ordinary subscriptions are rejected); acks and errors are delivered through the same RFQ queue. Events are raw JSON without the `e`/`E` envelope, one per frame:
 
 - `{"_v":1,"type":"rfq","op":"set","rfq_id":"...","rfq":{"symbol":"BTC-USD","size":"2.5","side":"buy","created_at_ms":...,"expires_at_ms":...}}` (`op: "clear"` omits `rfq`; `side` is the requester's side and may be absent = both sides).
 - `{"_v":1,"type":"prosp_rfq","op":"set"|"clear","symbol":"...","kind":"conditional"|"liquidation","source_seq":...,"source_time_ms":...,"expires_at_ms":...,"conditional":{...}|"liquidation":{...}}`.
 
-Errors: `401 Authentication required before subscribing to RFQ`, `403 RFQ subscription requires an authorized Quoter account`, `400 RFQ subscriptions require exactly method, channel, and id`, `400 Invalid RFQ subscription request`, `400 RFQ sockets cannot have ordinary subscriptions` (socket already has ordinary subscriptions), `503 RFQ subscriptions are unavailable`. There is no snapshot or replay: on reconnect, drop all RFQ state and wait for new events; drop events past `expires_at_ms`.
+Errors, in check order: `400 Invalid JSON format` (unparseable / duplicate keys) -> `400 RFQ subscriptions require exactly method, channel, and id` -> `400 Invalid RFQ subscription request` (wrong method/channel or non-integer `id`) -> `401 Authentication required before subscribing to RFQ` -> `400 RFQ sockets cannot have ordinary subscriptions` (socket already has ordinary subscriptions) -> `503 RFQ subscriptions are unavailable` -> `403 RFQ subscription requires an authorized Quoter account`. Re-subscribing an already subscribed socket just re-acks. There is no snapshot or replay: on reconnect, drop all RFQ state and wait for new events; drop events past `expires_at_ms`.
 
 ## Resync After Reconnect
 

@@ -39,6 +39,10 @@ npx strike-finance-skills install --agents claude cursor codex
 | `strike-userstream` | Authenticated WebSocket (`session.logon`) for orders, fills, balances, positions, strategies |
 | `strike-calculations` | Backend-matching formulas: liquidation price, PnL, margin tiers, balances, fees, funding |
 | `strike-history` | Positions, closed positions, position history, order/fill/funding/transaction history |
+| `strike-grid-bot` | Grid trading bots: create, stop, list, orders, lifecycle, user-stream events |
+| `strike-copy-trading` | Copy trading: discover lead traders, subscribe/update/stop, reserved balance, profit share |
+| `strike-rfq` | Request-for-quote: requester and quoter flows, RFQ socket, status lifecycle |
+| `strike-vaults` | Vaults: public vault data, create, deposit, withdraw, pause/resume, leader trading |
 
 ## API Base URLs
 

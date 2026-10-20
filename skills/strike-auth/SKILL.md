@@ -18,13 +18,15 @@ Integrators (builders, bots, market makers) authenticate with an **API wallet**:
 
 | Group | Auth | Examples |
 |-------|------|----------|
-| Public | none | `GET /v2/ping`, `/v2/time`, `/v2/markets`, `/v2/fee-tiers`, `POST /auth/builder/*` |
-| Read (FlexibleAuth) | optional | `GET /v2/account`, `/v2/balances`, `/v2/portfolio`, `/v2/positions`, `/v2/openOrders`, `/v2/history/*` |
-| API wallet or JWT | required | `GET /v2/sub-accounts`, RFQ routes; also `GET /v2/symbols`, `/v2/withdraw/limits`, `/v2/withdraw/queue-position` (FlexibleAuth group, but the handler needs an account: `401 {"error":"account_id not found in auth context"}`) |
-| Trading | required | orders, leverage, margin, `/v2/deposit/quote`, `/v2/deposit/build-tx`, `/v2/deposit`, `/v2/withdraw/quote`, `/v2/withdraw/estimate`, `/v2/withdraw` |
-| JWT-only (Strike app) | JWT | `POST /v2/account`, `/v2/account/profile`, `/v2/wallet(s)`, `/v2/builder`, sub-account create/transfer, `/v2/pending-quotes`, `/v2/deposit/cardano/address` |
+| Public | none | `GET /v2/ping`, `/v2/time`, `/v2/markets`, `/v2/fee-tiers`, `POST /auth/builder/*`; vault reads `GET /v2/vaults`, `/v2/vault/:id`, `/v2/vault/:id/{history,portfolio,depositors,liquidations,announcements}`; copy discovery `GET /v2/copy/lead-traders`, `/v2/copy/leaderboard`, `/v2/copy/copiers`, `/v2/copy/discover`, `/v2/copy/discover/filters`, `/v2/copy/discover/:address` |
+| Read (FlexibleAuth) | optional | `GET /v2/account`, `/v2/balances`, `/v2/portfolio`, `/v2/positions`, `/v2/openOrders`, `/v2/history/*`, `/v2/algo/twap*`, grid bot reads (`/v2/grid/bot`, `/v2/grid/bot/:id`, `/v2/grid/bot/:id/orders`), copy reads (`/v2/copy/subscriptions`, `/v2/copy/orders`, `/v2/copy/positions`, `/v2/copy/lead/stats`, `GET /v2/copy/saved`), vault depositor reads (`/v2/vault/position`, `/v2/vault/positions`, `/v2/vault/history`, `/v2/vault/my-deposits/history`) |
+| API wallet or JWT | required | `GET /v2/sub-accounts`, `GET /v2/rfq/:rfq_id`, `GET /v2/vault/:id/recovery-settings`, `POST /v2/copy/saved`, `DELETE /v2/copy/saved/:account_id`; also `GET /v2/symbols`, `/v2/withdraw/limits`, `/v2/withdraw/queue-position` (FlexibleAuth group, but the handler needs an account: `401 {"error":"account_id not found in auth context"}`) |
+| Trading | required | orders, leverage, margin, TWAP; grid bot `POST /v2/grid/bot`, `DELETE /v2/grid/bot/:id`; copy `POST /v2/copy/subscribe`, `PATCH`/`DELETE /v2/copy/subscribe/:id`; RFQ `POST /v2/rfq`, `DELETE /v2/rfq/:rfq_id`, `PUT /v2/rfq/:rfq_id/response`; masterOnly: vault `POST /v2/vault/create`, `/v2/vault/deposit`, `/v2/vault/withdraw`, `/v2/vault/:id/withdrawals/:withdrawal_id/cancel`, `/v2/vault/:id/pause`, `/v2/vault/:id/resume`, `PATCH /v2/vault/:id/recovery-settings`, and `/v2/deposit/quote`, `/v2/deposit/build-tx`, `/v2/deposit`, `/v2/withdraw/quote`, `/v2/withdraw/estimate`, `/v2/withdraw` |
+| JWT-only (Strike app) | JWT | `POST /v2/account`, `/v2/account/profile`, `/v2/wallet(s)`, `/v2/builder`, sub-account create/transfer, `/v2/pending-quotes`, `/v2/deposit/cardano/address`, `/v2/copy/labels*`, vault announcements `POST /v2/vault/:id/announcements`, `DELETE /v2/vault/:id/announcements/:announcement_id` |
 
-- **FlexibleAuth**: if `X-API-Wallet-Public-Key` is present the request is fully verified as an API wallet request (any failure → `401`, even on otherwise public reads). Without it, a JWT is optional and anonymous callers can read public data by passing `account_id`, `vault_id`, or `blockchain_address` (see strike-account).
+Details: strike-trading, strike-rfq, strike-grid-bot, strike-copy-trading, strike-vaults.
+
+- **FlexibleAuth**: if `X-API-Wallet-Public-Key` is present the request is fully verified as an API wallet request (any failure → `401`, even on otherwise public reads). Without it, a JWT is optional and anonymous callers can read public data by passing `account_id`, `vault_id`, or `blockchain_address` (see strike-account). Reads that only serve the caller's own data (e.g. `/v2/copy/subscriptions`, `GET /v2/copy/saved`) still return `401` without auth.
 - **API wallet or JWT**: same, but some authentication is required (no API wallet headers and no JWT → `401 {"error":"missing authorization header"}`).
 - **Trading**: API wallet requests skip the app's periodic wallet-signature gate (`RequireEnableTrading` only applies to JWT sessions).
 - **masterOnly** (vault management, all deposit and withdraw writes, credit writes): rejects API wallets bound to a sub-account with `403 {"error":"not available to sub-account API keys"}`.
@@ -230,6 +232,7 @@ The User WebSocket (`wss://<host>/ws/user-api`) uses the same key with its own l
 
 Only meaningful for API wallets created through builder connect (they carry the builder code). Read on `POST /v2/order`, `/v2/orders/batch`, `/v2/orders/replace`, `/v2/order/replace-batch` and `/v2/order/strategy`. `POST /v2/order/replace` ignores it and does not attach the builder code at all: its new order carries no builder attribution, no builder fee and no approval check.
 
+- Grid bot, copy-trading and TWAP orders never carry a builder code (the header is ignored on those routes).
 - Integer basis points, `0`–`100` (deployment cap, default 100 = 1%). Omitted → the orders carry your builder code with a fee of `0`.
 - Must be `<=` the builder code's configured fee share **and** `<=` the `fee_share_bps` the user approved for the trading account.
 - Failures return `400`: `invalid X-Builder-Fee-Bps header: must be an integer between 0 and 100 (basis points; 100 = 1%)`, `X-Builder-Fee-Bps 50 exceeds builder max of 20`, `X-Builder-Fee-Bps 50 exceeds your approved max of 20`, `account has not approved builder "code"`, `builder "code" is not active`, `builder code "code" not found`.
@@ -237,7 +240,7 @@ Only meaningful for API wallets created through builder connect (they carry the 
 
 ## Sub-Accounts
 
-- A wallet bound to a **master** account (every builder-connect wallet) acts on the master by default and can target an owned, active sub-account by passing `sub_account_id` (query param on reads, body field on writes, as each endpoint documents). Unowned or inactive ids are rejected: `403 {"error":"sub-account access denied"}` on write/trading routes (and `GET /v2/symbols`, `include_copies` reads); `401 {"error":"authentication required or provide vault_id, account_id, or blockchain_address"}` on reads that accept public selectors (`/v2/account`, `/v2/balances`, `/v2/portfolio`, `/v2/positions`, `/v2/closedPositions`, `/v2/openOrders`, `GET /v2/order`, `/v2/history/*`).
+- A wallet bound to a **master** account (every builder-connect wallet) acts on the master by default and can target an owned, active sub-account by passing `sub_account_id` (query param on reads, body field on writes, as each endpoint documents). Unowned or inactive ids are rejected: `403 {"error":"sub-account access denied"}` on write/trading routes, `GET /v2/symbols`, `include_copies` reads, and strategy/copy reads (TWAP, grid bot, copy subscriptions/orders/positions); `401 {"error":"authentication required or provide vault_id, account_id, or blockchain_address"}` on reads that accept public selectors (`/v2/account`, `/v2/balances`, `/v2/portfolio`, `/v2/positions`, `/v2/closedPositions`, `/v2/openOrders`, `GET /v2/order`, `/v2/history/*`).
 - A wallet bound to a **sub-account** (created in the Strike app via `POST /v2/wallet` with `sub_account_id`) authenticates as that sub-account only. It cannot read or trade its master or siblings, cannot use `scope=all`, and every masterOnly route (deposits, withdrawals, vault management, credit writes) returns `403`. Deleting the sub-account revokes its wallets.
 
 ## TypeScript Example

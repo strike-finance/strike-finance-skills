@@ -133,7 +133,7 @@ All values here are JSON **numbers**. Note the PascalCase keys in `feeTiers` (`M
 | Query param | Auth | Notes |
 |-------------|------|-------|
 | `account_id` | none | Must be a UUID (otherwise `400 invalid account_id`; use `vault_id` for vaults) |
-| `vault_id` | none | Vault's trading account |
+| `vault_id` | none | Vault's trading account (see strike-vaults) |
 | `blockchain` + `blockchain_address` | none | Exact chain lookup |
 | `blockchain_address` | none | Chain inferred from the address (max 512 chars) |
 | `sub_account_id` | required | Caller's own active sub-account |
@@ -231,7 +231,7 @@ Returns an **array** with one USD-margin entry.
 | `positionInitialMargin` | string | |
 | `openOrderInitialMargin` | string | Always `"0"` (open-order margin is already deducted from `availableBalance`) |
 | `crossWalletBalance`, `crossUnPnl` | string | Equal to `walletBalance` / `unrealizedPnl` (isolated amounts are not separated) |
-| `availableBalance` | string | Same as `available_balance` |
+| `availableBalance` | string | Same as `available_balance` (copy-trading holds already subtracted) |
 | `maxWithdrawAmount` | string | Engine withdrawal cap — the largest `usd_value` `POST /v2/withdraw/quote` accepts: max(0, wallet − open-order margin − isolated balances − max(cross IM − cross uPnL, cross MM)), capped at wallet − `lockedRewards`, minus copy-trading holds |
 | `marginAvailable` | boolean | Always `true` |
 | `updateTime` | number | Unix ms (response time) |

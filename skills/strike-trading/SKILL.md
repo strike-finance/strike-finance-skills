@@ -112,7 +112,7 @@ How types execute:
 
 Trigger direction: `stop*` sell fires at price ≤ `stop_price`, buy at ≥; `take_profit*` sell at ≥, buy at ≤. A conditional that would fire immediately is rejected (`conditional_order_triggers_immediately`), as is a trailing `activation_price` already crossed.
 
-**Builder fee** — header `X-Builder-Fee-Bps: <0-100>` (bps of fill notional, 100 = 1%) when the API wallet has a builder code. Must be ≤ the builder's `fee_share_bps` and ≤ the account's approved max, else `400` (e.g. `X-Builder-Fee-Bps 50 exceeds your approved max of 20`); nothing is placed. For builder wallets the builder must be active and approved even with no header. Approval is looked up on the calling account, or on `sub_account_id` when one is sent — never on a vault (vault trades use the leader's approval). Builder connect only approves the wallet's own (master) account, so a builder-code wallet sending `sub_account_id` gets `400 account has not approved builder "<code>"` unless that sub-account approved the builder. Honored by `/v2/order`, `/v2/orders/batch`, `/v2/orders/replace`, `/v2/order/replace-batch`, `/v2/order/strategy` (all legs). **Not** by `/v2/order/replace`: its replacement order carries no builder code at all (no builder fee, no builder attribution).
+**Builder fee** — header `X-Builder-Fee-Bps: <0-100>` (bps of fill notional, 100 = 1%) when the API wallet has a builder code. Must be ≤ the builder's `fee_share_bps` and ≤ the account's approved max, else `400` (e.g. `X-Builder-Fee-Bps 50 exceeds your approved max of 20`); nothing is placed. For builder wallets the builder must be active and approved even with no header. Approval is looked up on the calling account, or on `sub_account_id` when one is sent — never on a vault (vault trades use the leader's approval). Builder connect only approves the wallet's own (master) account, so a builder-code wallet sending `sub_account_id` gets `400 account has not approved builder "<code>"` unless that sub-account approved the builder. Honored by `/v2/order`, `/v2/orders/batch`, `/v2/orders/replace`, `/v2/order/replace-batch`, `/v2/order/strategy` (all legs). **Not** by `/v2/order/replace` (its replacement order carries no builder code at all — no builder fee, no attribution), nor by TWAP, grid bot or copy-trading orders, which never carry a builder code.
 
 **Response 201:**
 ```json
@@ -219,6 +219,8 @@ Body (JSON on DELETE — the signature covers its hash): `{ "symbol": "BTC-USD",
 
 Body `{}` (all symbols) or `{ "symbol": "BTC-USD" }`; an empty body is `400 {"error":"EOF"}`. Cancels open, pending and untriggered orders (TP/SL included).
 
+**Bot orders on the same account are canceled too.** Grid bot orders (`client_order_id` `<bot_id>:grid-<n>:entry|:tp|:sl`, bot IDs start with `grid-`) are not exempt: a canceled grid **entry** permanently removes that grid level, while a canceled grid TP/SL on a filled level is re-placed by the bot (see strike-grid-bot). Copy-trading orders (`copy:<subscription_id>:<lead_order_id>`) are always market IOC and never rest, so cancel-all does not affect them in practice. To spare bots, cancel your own orders by ID instead.
+
 ```json
 { "account_id": "...", "symbol": "BTC-USD", "canceled_count": -1, "sequence_id": 70804203, "message_id": "..." }
 ```
@@ -243,7 +245,7 @@ Each order is placed separately (own sequence ID, any symbol, no atomicity). Req
 |---|---|
 | `POST /v2/order/replace` | `{ "cancel": { "order_id": 1, "symbol": "BTC-USD" }, "new_order": { /* CreateOrder */ }, "vault_id": "opt" }` — either leg optional |
 | `POST /v2/order/replace-batch` | `{ "replacements": [ { "cancel": {...}, "new_order": {...} } ], "vault_id": "opt" }` |
-| `POST /v2/orders/replace` | `{ "symbol": "BTC-USD", "orders": [ /* CreateOrder without symbol/vault_id/sub_account_id */ ], "vault_id": "opt" }` — cancels **every** active order on the symbol (TP/SL too) first |
+| `POST /v2/orders/replace` | `{ "symbol": "BTC-USD", "orders": [ /* CreateOrder without symbol/vault_id/sub_account_id */ ], "vault_id": "opt" }` — cancels **every** active order on the symbol first: TP/SL and grid bot orders too (same consequences as cancel-all) |
 
 Rules:
 - One symbol per request (`mismatched_order_symbol`). Cancel legs need `order_id` (`order_id_not_set`); unknown IDs are skipped.
@@ -341,6 +343,7 @@ Sync `400`: `no position found for symbol`, `position must be in isolated margin
 - `side` uppercase `BUY` | `SELL`; `duration_sec` 300–86400; `limit_price` optional (> 0) — slices that would cross it are skipped and the shortfall rolls forward.
 - Slices: `clamp(duration_sec / 30, 5, 120)` market IOC child orders, `client_order_id` `twap-{strategy_id}-{n}`. `total_size` is rounded down to the market step; each slice must meet min size and min notional.
 - Max 20 `active` + `cancelling` TWAPs per account. Optional `vault_id` / `sub_account_id`.
+- `X-Builder-Fee-Bps` is ignored: TWAP child orders never carry a builder code (no builder fee or attribution).
 
 `201 { "strategy_id": "019a...", "status": "active" }`. Errors: `400 invalid twap request: duration_sec must be >= 300` (and similar), `409 twap concurrent limit exceeded`, `503 algo twap service not configured`.
 
@@ -428,4 +431,4 @@ await strike("POST", "/v2/algo/twap", { symbol: "BTC-USD", side: "BUY", total_si
 ## Notes
 
 - Direct Market Access (`direct-eu.strikefinance.org`) is provisioned by Strike per API wallet (IP allowlist + scopes). It serves only: `POST /v2/order`, `/v2/orders/batch`, `/v2/orders/replace`, `/v2/order/replace`, `/v2/order/replace-batch`, `DELETE /v2/order/cancel`, `/v2/order/cancel-all`, and `GET /v2/order`, `/v2/openOrders`, `/v2/history/order`, `/v2/history/fill`, `/v2/account`, `/v2/symbols`, `/v2/balances`, `/v2/positions`, `/v2/closedPositions`, `/v2/history/funding` (plus a few public market routes). Strategy, leverage, marginMode, `PUT /v2/symbols`, isoMargin and TWAP return `403 route is not available on the direct endpoint`. Unprovisioned wallets get `403 direct market access denied`; exceeding the profile quota gives `429 direct market access denied`.
-- Not covered here: grid bots, copy trading, RFQ, vault management (the `vault_id` selector above is how a vault leader trades).
+- Related skills: `strike-grid-bot` (grid bots), `strike-copy-trading` (copy trading), `strike-rfq` (request-for-quote), `strike-vaults` (vault management; the `vault_id` selector above is how a vault leader trades).
