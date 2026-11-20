@@ -20,12 +20,15 @@ info:
       `{"error": "..."}`.
     - Endpoints served from the in-process short-TTL cache (about 5 s) set
       `X-Cache: HIT|MISS`.
+    - Do not hard-code market lists: `GET https://<host>/v2/markets` (API host, no
+      `/price`) lists every market with its `asset_class` and `tags`;
+      `/v2/exchangeInfo` and `/v2/fundingInfo` also enumerate markets.
 
     Real-time streams are on the public price WebSocket `wss://<host>/ws/price`
     (see the strike-price-feeds skill). The L3 market-by-order feed is a separate
     service: `GET https://<host>/v2/l3/snapshot` (documented below with its own
     `servers`, no `/price` prefix) and `wss://<host>/ws/l3`.
-  version: 2.0.0
+  version: 2.1.0
   contact:
     name: Strike Finance
     url: https://www.strikefinance.org
@@ -75,32 +78,30 @@ paths:
       - Order Book
       summary: Order Book Depth
       description: |
-        Returns the latest order book snapshot for a symbol, read live from the
-        engine's snapshot (not cached, no `X-Cache` header).
+        Returns the full book the WebSocket `<symbol>@depth` stream last published
+        (not cached, no `X-Cache` header).
 
         | Field          | Type       | Description |
         |----------------|------------|-------------|
-        | `lastUpdateId` | uint64     | Order-book update ID of the snapshot (same ID domain as WS `depthUpdate` `U`/`u` and `bookTicker` `u`). `0` when no snapshot exists. |
-        | `E`            | int64      | Server time when this response was built (ms). |
-        | `T`            | int64      | Time the engine produced the snapshot (ms). |
+        | `lastUpdateId` | uint64     | The `u` of the last `depthUpdate` published for the symbol; the next one has `pu` equal to this. `0` when nothing has been published for the symbol (or it is unknown). |
+        | `E`            | int64      | Response time (ms). |
+        | `T`            | int64      | Matching-engine time of this book (ms); the response time when nothing has been published. |
         | `bids`         | string[][] | `[price, quantity]`, best (highest) first. |
         | `asks`         | string[][] | `[price, quantity]`, best (lowest) first. |
 
-        An unknown symbol returns `200` with `lastUpdateId: 0` and empty `bids`/`asks`.
+        No level has a zero size. An unknown symbol returns `200` with
+        `lastUpdateId: 0` and empty `bids`/`asks`. A side that returns fewer than
+        `limit` levels is complete.
 
         ### Using it with the WebSocket `<symbol>@depth` stream
 
-        The WS stream only carries the **top 20 levels per side** as diffs. Seed a
-        local book with `limit=20`, drop buffered WS events with `u <= lastUpdateId`,
-        apply the rest, and treat a level reported as `"0"` as removed (it may only
-        have dropped out of the top 20). `U`/`u` are not contiguous between messages.
-        Diffs are computed against the server's previously published top 20 (the
-        previous WS message), not against this REST snapshot, so periodic re-sync is
-        required for correctness, not only to recover dropped messages.
-        In WS messages `b`/`a` is `null` when that side did not change, and the first
-        message after a symbol gets its first subscriber is the full top 20 with no
-        `"0"` removals, so re-seed from this endpoint after the first WS message.
-        (This REST response always returns arrays for `bids`/`asks`.)
+        The stream carries diffs of the **whole book** (absolute sizes; `"0"` removes
+        the level), each with `pu` = the previous message's `u`. Subscribe and buffer,
+        fetch this endpoint, drop buffered events with `u <= lastUpdateId`; the first
+        remaining event must have `pu == lastUpdateId` and each later one `pu ==` the
+        previous `u`. On any `pu` mismatch or reconnect, fetch this endpoint again.
+        `U` need not be `pu + 1`. In WS messages `b`/`a` is `null` when that side did
+        not change (this REST response always returns arrays).
       parameters:
       - name: symbol
         in: query
@@ -114,9 +115,9 @@ paths:
         schema:
           type: integer
           minimum: 1
-          maximum: 1000
-          default: 20
-        description: Levels per side. Values above 1000 are clamped to 1000; non-numeric or <= 0 falls back to 20.
+          maximum: 65534
+          default: 1000
+        description: Levels per side. Values above 65534 are clamped; missing, non-numeric or <= 0 uses 1000.
       responses:
         '200':
           description: Order book snapshot
@@ -148,14 +149,20 @@ paths:
                 code: MISSING_PARAMETER
                 msg: symbol parameter is required
         '500':
-          description: Redis read failed
+          description: Snapshot read or decode failed
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
-              example:
-                code: INTERNAL_ERROR
-                msg: failed to retrieve orderbook
+              examples:
+                readFailed:
+                  value:
+                    code: INTERNAL_ERROR
+                    msg: failed to retrieve orderbook
+                decodeFailed:
+                  value:
+                    code: INTERNAL_ERROR
+                    msg: failed to decode orderbook snapshot
   /v2/trades:
     get:
       tags:
@@ -164,7 +171,20 @@ paths:
       description: |
         Returns the most recent public trades for a symbol, **newest first**. The
         server keeps the latest 1000 trades per symbol; there is no older paging on
-        this endpoint. Unknown symbols return `[]`. Cached about 5 s (`X-Cache`).
+        this endpoint. Unknown symbols return `[]`. Cached about 5 s (`X-Cache`),
+        except requests with `fromSeq`.
+
+        - `id` is exchange-wide (shared by every market), so one market's IDs increase
+          but skip; an ID gap is not a missed trade.
+        - `seq` is the trade's number on its market, +1 per trade, the same value as
+          `seq` on the WS `<symbol>@trade` stream. It never goes back or restarts.
+          Absent for a moment on a trade the stream has not published yet.
+        - Refill a gap: `fromSeq` = last `seq` received + 1, then the highest `seq`
+          returned + 1, until the response is empty. Drop duplicates by `seq`.
+        - `order_type`: `fill`, `liquidation` (taker was a position being liquidated
+          on the book) or `adl` (auto-deleveraging at a settlement price, off the book;
+          the force-closed side is the taker). ADL trades are listed and numbered but
+          left out of candles, last price and 24h volume.
       parameters:
       - name: symbol
         in: query
@@ -181,6 +201,15 @@ paths:
           maximum: 1000
           default: 100
         description: Number of trades. Clamped to 1000; non-numeric or <= 0 falls back to 100.
+      - name: fromSeq
+        in: query
+        required: false
+        schema:
+          type: integer
+          format: uint64
+          minimum: 0
+        example: 812
+        description: Return the oldest `limit` trades with `seq >= fromSeq` (still newest first). Trades without a `seq` are not returned. Not cached.
       responses:
         '200':
           description: Recent trades, newest first
@@ -192,20 +221,28 @@ paths:
                   $ref: '#/components/schemas/TradeResponse'
               example:
               - id: 18071
+                seq: 812
                 price: '77117.60'
                 qty: '0.0099'
                 quoteQty: '763.464240'
                 time: 1792172831028
                 isBuyerMaker: true
+                order_type: fill
         '400':
-          description: Missing symbol
+          description: Missing symbol or invalid `fromSeq`
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
-              example:
-                code: MISSING_PARAMETER
-                msg: symbol parameter is required
+              examples:
+                missingSymbol:
+                  value:
+                    code: MISSING_PARAMETER
+                    msg: symbol parameter is required
+                badFromSeq:
+                  value:
+                    code: INVALID_PARAMETER
+                    msg: fromSeq must be a non-negative integer
   /v2/premiumIndex:
     get:
       tags:
@@ -213,9 +250,18 @@ paths:
       summary: Premium Index / Funding Window
       description: |
         Committed mark and index prices plus statistics of the active funding window.
-        With `symbol` returns one object; without it returns an array for all symbols.
-        Premium-index samples are taken every 5 s; `latestPremiumIndex` is `"0"` until
-        the active window has its first sample.
+        With `symbol` returns one object; without it returns an array for all symbols
+        (sorted by symbol).
+
+        Funding is hourly: the active window is the current UTC hour and
+        `nextFundingTime` is its end. Premium-index samples are taken nominally every
+        5 s; `averagePremiumIndex` is duration-weighted. At the start of each window
+        both premium values are `"0"` and `premiumIndexCount` is `0`, and
+        `fundingRate` (the live **hourly** estimate, same as WS `r`) is the
+        interest-only baseline until samples accumulate. `interestRate`,
+        `interestRateDampener` (8-hour basis) and `fundingMultiplier` are the active
+        per-market funding parameters; the 8-hour rate is clamped to the market's
+        floor/cap and divided by 8 (see `/v2/fundingInfo`).
       parameters:
       - name: symbol
         in: query
@@ -265,15 +311,82 @@ paths:
               example:
                 code: SERVICE_UNAVAILABLE
                 msg: price engine is initializing
+  /v2/fundingInfo:
+    get:
+      tags:
+      - Prices
+      summary: Funding Interval and Limits
+      description: |
+        Each market's funding interval and the cap and floor on its funding rate, as
+        used by the running price engine. With `symbol` returns one object; without
+        it returns an array for every market, sorted by symbol.
+
+        Funding is paid every hour. `fundingRateCap` and `fundingRateFloor` are per
+        funding interval (hourly), the same unit as `fundingRate` on
+        `/v2/premiumIndex` and `r` on the mark-price stream: the market's 8-hour
+        bounds divided by 8. A changed setting is reflected after the price engine
+        restarts.
+      parameters:
+      - name: symbol
+        in: query
+        required: false
+        schema:
+          type: string
+        example: BTC-USD
+      responses:
+        '200':
+          description: Funding info (object, or array when `symbol` is omitted)
+          content:
+            application/json:
+              schema:
+                oneOf:
+                - $ref: '#/components/schemas/FundingInfoResponse'
+                - type: array
+                  items:
+                    $ref: '#/components/schemas/FundingInfoResponse'
+              example:
+                symbol: BTC-USD
+                fundingIntervalHours: 1
+                fundingRateCap: '0.005'
+                fundingRateFloor: '-0.005'
+        '400':
+          description: Unknown symbol
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: INVALID_SYMBOL
+                msg: invalid symbol
+        '500':
+          description: Invalid running funding setting
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: INTERNAL_ERROR
+                msg: failed to retrieve funding info
+        '503':
+          description: Price engine still initializing
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: SERVICE_UNAVAILABLE
+                msg: price engine is initializing
   /v2/markPrice:
     get:
       tags:
       - Prices
       summary: Mark Price
       description: |
-        Current mark-price snapshot, same shape as the WS `markPriceUpdate` event.
-        With `symbol` returns one object (cached about 5 s, `X-Cache`); without it
-        returns an array for all symbols (possibly `[]`).
+        Current mark-price snapshot, same shape as the WS `markPriceUpdate` event
+        without its `stream` field. With `symbol` returns one object (cached about
+        5 s, `X-Cache`); without it returns an array for all symbols (possibly `[]`).
+        `r` is the live hourly funding-rate estimate for the current window and `T`
+        the time that window settles.
       parameters:
       - name: symbol
         in: query
@@ -355,7 +468,8 @@ paths:
       - Ticker
       summary: 24hr Ticker Statistics
       description: |
-        Rolling 24h statistics built from 1m last-price candles. With `symbol` returns
+        Rolling 24h statistics built from 1m last-price candles (ADL trades are not
+        counted). With `symbol` returns
         one object (cached about 5 s, `X-Cache`); without it returns an array of only
         the markets that have 24h candle data. A single-symbol request for a market
         without 24h data (or an all-markets request when no market has data) falls
@@ -502,12 +616,14 @@ paths:
         - `status`: `ACTIVE` (trading), `PRE_TRADING`, `BREAK`, `CLOSED`; `active` and
           `visibleOnUI` are true only for trading markets.
         - `category`/`subCategory`: `Crypto`/`""`, or `TradFi` with `FX`, `Commodity`,
-          `Equity` or `Index`.
+          `Equity` or `Index`, derived from the market's `asset_class` (the value
+          `GET /v2/markets` serves with `tags` for finer grouping).
         - `collateralAssetName`: the symbol suffix after `-` (e.g. `USD`).
         - `marketStats.volume24h` is quote volume, `volumeBase24h` base volume.
         - `marketStats.nextFundingRate` is the **next funding time** in ms (name kept for compatibility).
-        - `marketStats.openInterestBase` is the stored sum of absolute position sizes
-          (long + short, i.e. 2x `/v2/openInterest`); `openInterest` is that value x mark price.
+        - `marketStats.openInterestBase` is one-sided open interest in base units (the
+          same figure as `/v2/openInterest`); `openInterest` is that value x mark price.
+        - `createdAt` is Unix ms (`0` when unset).
       parameters:
       - name: symbol
         in: query
@@ -612,12 +728,13 @@ paths:
       - Exchange Info
       summary: Exchange Information
       description: |
-        Trading rules for all markets. The response is built once and then served
-        from a non-expiring in-process cache (`X-Cache`), so `serverTime` is the time
-        the cache was filled, not the current time. `rateLimits` is a static list.
-        `quoteAsset` and `marginAsset` are always `USDT` (placeholders; markets are
-        quoted in USD). `status` is the lowercase market status
-        (`pre_trading`, `trading`, `break`, `close`).
+        Trading rules for all markets. The response is rebuilt from the market
+        configs every 2 s in the background and served from that cache (`X-Cache`),
+        so `serverTime` is when the cached copy was built (up to ~2 s old), not a
+        clock. `rateLimits` and `orderType` are static lists; `timeInForce` lists the
+        engine's time-in-force values (`GTC`, `IOC`, `ALO`). `quoteAsset` and
+        `marginAsset` are the symbol suffix (`BTC-USD` -> `USD`). `status` is the
+        lowercase market status (`pre_trading`, `trading`, `break`, `close`).
 
         Filters per symbol: `PRICE_FILTER` (`minPrice`, `maxPrice`, `tickSize`),
         `LOT_SIZE` (limit orders: `minQty`, `maxQty`, `stepSize`), `MARKET_LOT_SIZE`
@@ -663,9 +780,13 @@ paths:
 
         ### Gap filling and continuity
         Missing periods between candles are filled with flat candles at the previous
-        close and zero volume. Nothing is synthesized before the market's first candle.
+        close and zero volume. Nothing is synthesized before the market's first candle
+        (a `startTime` before listing returns rows from the first candle).
         For `last`, each closed candle's `open` is set to the previous candle's close
         (the WebSocket candle's `o` is the period's first trade price instead).
+        `last` candles exclude ADL trades. Closed `mark`/`index` candles of `3m` and
+        longer are rebuilt from the period's recorded `1m` candles; the in-progress
+        `mark`/`index` candle's `open` is the previous candle's close when adjacent.
 
         ### Price types
         | `priceType` | Series |
@@ -1052,11 +1173,12 @@ paths:
         The real-time feed is `wss://<host>/ws/l3`, stream `<symbol>@l3` (see the
         strike-orderbook skill for the update events and bootstrap rules).
 
-        - Only allowlisted symbols are served (currently `BTC-USD`); `symbol` is
-          trimmed and upper-cased.
+        - Every market the engine publishes is served (new markets join at sequence
+          0); any other symbol returns `400`. `symbol` is trimmed and upper-cased.
         - Complete book, never truncated or paginated. Bids descending, asks
-          ascending, orders within a level in FIFO priority. A level's `price` text is
-          its first order's spelling (equal prices can differ in trailing zeros).
+          ascending, orders within a level in FIFO priority. Prices and sizes are
+          canonical decimal strings without trailing zeros (`"72247.3"`), the same
+          spelling as in WS updates.
         - `last_sequence` is in the same per-symbol domain as WS `l3_update.sequence`;
           apply updates with `sequence > last_sequence`, each exactly previous + 1.
         - `timestamp` is the server time of the read.
@@ -1081,11 +1203,11 @@ paths:
                 last_sequence: 11197
                 timestamp: 1792438895126
                 bids:
-                - price: '72247.30'
+                - price: '72247.3'
                   orders:
                   - order_id: 9Ix5zep5IpZafACmP1p_3Q
                     size: '0.01107'
-                - price: '72178.80'
+                - price: '72178.8'
                   orders:
                   - order_id: OKIEOZ727YYzn5Cy8JOxGA
                     size: '0.01108'
@@ -1158,7 +1280,7 @@ components:
         lastUpdateId:
           type: integer
           format: uint64
-          description: Order-book update ID of the snapshot; 0 when no snapshot exists.
+          description: The `u` of the last published `depthUpdate`; the next one has `pu` equal to this. 0 when nothing has been published.
         E:
           type: integer
           format: int64
@@ -1166,7 +1288,7 @@ components:
         T:
           type: integer
           format: int64
-          description: Snapshot time from the engine (Unix ms).
+          description: Matching-engine time of this book (Unix ms); the response time when nothing has been published.
         bids:
           type: array
           items:
@@ -1187,7 +1309,11 @@ components:
         id:
           type: integer
           format: int64
-          description: Trade ID (same as WS `trade.t`).
+          description: Exchange-wide trade ID (same as WS `trade.t`). Increases per market but skips; not a gap signal.
+        seq:
+          type: integer
+          format: uint64
+          description: The trade's number on its market, +1 per trade (same as WS `trade.seq`). Absent for a moment on a trade the stream has not published yet.
         price:
           type: string
         qty:
@@ -1202,7 +1328,14 @@ components:
           description: Trade time (Unix ms).
         isBuyerMaker:
           type: boolean
-          description: true when the buyer was the maker (sell-side taker).
+          description: true when the buyer was the maker (sell-side taker). On an ADL trade the force-closed side is the taker.
+        order_type:
+          type: string
+          enum:
+          - fill
+          - liquidation
+          - adl
+          description: '`fill` (ordinary), `liquidation` (taker was a position being liquidated) or `adl` (auto-deleveraging, off the book). Older stored trades report `fill`.'
     PremiumIndexResponse:
       type: object
       properties:
@@ -1217,25 +1350,44 @@ components:
           description: Latest premium-index sample in the active funding window ("0" before the first sample).
         averagePremiumIndex:
           type: string
-          description: Average of the samples in the active window.
+          description: Duration-weighted average premium index of the active window.
         premiumIndexCount:
           type: integer
           description: Number of samples in the active window.
         fundingRate:
           type: string
-          description: Funding rate estimated from the active window.
+          description: Live estimated hourly funding rate for the active window (same as WS `r`).
         nextFundingTime:
           type: integer
           format: int64
+          description: End of the active (hourly) funding window, when it settles (Unix ms).
         interestRate:
           type: string
+          description: Active per-market interest rate (8-hour basis).
         interestRateDampener:
           type: string
+          description: Active per-market interest rate dampener (8-hour basis).
         fundingMultiplier:
           type: string
+          description: Active per-market multiplier applied to the average premium.
         time:
           type: integer
           format: int64
+          description: Snapshot time (response time, Unix ms).
+    FundingInfoResponse:
+      type: object
+      properties:
+        symbol:
+          type: string
+        fundingIntervalHours:
+          type: integer
+          description: Hours between funding payments (1).
+        fundingRateCap:
+          type: string
+          description: Highest funding rate per interval (hourly), decimal fraction.
+        fundingRateFloor:
+          type: string
+          description: Lowest funding rate per interval (hourly), decimal fraction.
     MarkPriceResponse:
       type: object
       properties:
@@ -1258,11 +1410,11 @@ components:
           description: Index price.
         r:
           type: string
-          description: Funding rate.
+          description: Live estimated hourly funding rate for the current window (not the last settled rate).
         T:
           type: integer
           format: int64
-          description: Next funding time (Unix ms).
+          description: Next funding time, end of the current hourly window (Unix ms).
     IndexPriceResponse:
       type: object
       properties:
@@ -1404,6 +1556,7 @@ components:
         createdAt:
           type: integer
           format: int64
+          description: Unix ms (0 when unset).
     MarketStatsSnapshot:
       type: object
       properties:
@@ -1437,7 +1590,7 @@ components:
           description: openInterestBase x markPrice (USD).
         openInterestBase:
           type: string
-          description: Sum of absolute position sizes (long + short), base units.
+          description: One-sided open interest (total long size = total short size), base units. Same as /v2/openInterest.
     FearGreedResponse:
       type: object
       properties:
@@ -1485,7 +1638,7 @@ components:
         serverTime:
           type: integer
           format: int64
-          description: Time the cached response was built (not the current time).
+          description: Time the cached response was built (rebuilt every 2 s; not a clock).
         rateLimits:
           type: array
           items:
@@ -1529,10 +1682,10 @@ components:
           type: string
         quoteAsset:
           type: string
-          description: Always "USDT" (placeholder).
+          description: Symbol suffix after `-` (e.g. "USD" for BTC-USD).
         marginAsset:
           type: string
-          description: Always "USDT" (placeholder).
+          description: Same as quoteAsset.
         pricePrecision:
           type: integer
         quantityPrecision:
@@ -1575,7 +1728,7 @@ components:
           type: array
           items:
             type: string
-          description: Static list GTC, IOC, FOK.
+          description: Engine time-in-force values GTC, IOC, ALO.
     FilterInfo:
       type: object
       description: Only the fields relevant to `filterType` are present.
@@ -1603,7 +1756,7 @@ components:
           type: string
     Kline:
       type: array
-      description: '[openTime, open, high, low, close, volume, closeTime, quoteVolume, trades, takerBuyBase, takerBuyQuote, "0"]'
+      description: '[openTime, open, high, low, close, volume, closeTime, quoteVolume, trades, takerBuyBase, takerBuyQuote, "0"]. Despite the names, takerBuyBase/takerBuyQuote are the volume of trades with isBuyerMaker=true (taker sells).'
       minItems: 12
       maxItems: 12
       items:
@@ -1706,6 +1859,7 @@ components:
       properties:
         price:
           type: string
+          description: Canonical decimal without trailing zeros.
         orders:
           type: array
           items:
@@ -1716,4 +1870,4 @@ components:
                 description: Opaque 22-character base64url ID, stable for the order's lifetime.
               size:
                 type: string
-                description: Remaining size.
+                description: Remaining size (canonical decimal without trailing zeros).

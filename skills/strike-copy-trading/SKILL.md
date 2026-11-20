@@ -1,6 +1,6 @@
 ---
 name: strike-copy-trading
-description: Strike Finance copy trading -- follow a Strike account or an external Hyperliquid wallet, subscribe/update/stop (fixed ratio or fixed margin per entry, ratio multiplier, minimum entry, per-symbol and total margin caps, excluded symbols, stop loss, following the lead's leverage/margin mode, copying open positions, managed copy sub-accounts), funds reservation, Strike-lead profit share, copied orders and positions, trader discovery, leaderboard, copiers, lead stats and bookmarks. Use when building a copy-trading UI or bot, picking traders to copy, or reconciling copy-placed orders.
+description: Strike Finance copy trading -- follow a Strike account or an external Hyperliquid wallet, subscribe/update/stop (closing or, for Hyperliquid leads, keeping copied positions; fixed ratio or fixed margin per entry, ratio multiplier, minimum entry, per-symbol and total margin caps, excluded symbols, stop loss, following the lead's leverage/margin mode, copying open positions, managed copy sub-accounts), funds reservation, Strike-lead profit share, copied orders and positions, trader discovery, leaderboard, copiers, lead stats and bookmarks. Use when building a copy-trading UI or bot, picking traders to copy, or reconciling copy-placed orders.
 ---
 
 # Strike Finance Copy Trading
@@ -61,7 +61,7 @@ export async function copyApi<T>(
 |---|---|---|
 | POST | `/v2/copy/subscribe` | Start copying (201; 202 while a managed account is being set up) |
 | PATCH | `/v2/copy/subscribe/:id` | Change settings of an active subscription (204) |
-| DELETE | `/v2/copy/subscribe/:id` | Stop and close copied positions (204) |
+| DELETE | `/v2/copy/subscribe/:id` | Stop; closes copied positions unless kept (204) |
 | GET | `/v2/copy/subscriptions` | Follower's subscriptions with live PnL |
 | GET | `/v2/copy/orders` | Copy-triggered orders (incl. skipped/failed attempts) |
 | GET | `/v2/copy/positions` | Open positions split per subscription |
@@ -145,14 +145,15 @@ Body: any of `copy_amount` (fixed_ratio), `margin_per_entry_order` (fixed_amount
 
 ### DELETE /v2/copy/subscribe/:id
 
-Query: `sub_account_id` (optional). No body. Returns **204**.
+Query: `sub_account_id` (optional), `close_open_positions` (`true` by default, or `false`; non-boolean values → `400 close_open_positions must be true or false`). No body. Returns **204**.
 
 1. The subscription flips to `stopped` immediately (no new copies) and its PnL is snapshotted into `closed_pnl` (realized net of fees + unrealized at mark).
-2. **Copied positions are always closed**: one reduce-only market IOC per market, sized to this subscription's attributed size (your manual size and other subscriptions' size stay); a whole-position close is sent as `close_position`. Each close waits up to 30 s for the copy ledger to catch up; if it doesn't, that market is skipped.
+2. **Copied positions are closed** by default: one reduce-only market IOC per market, sized to this subscription's attributed size (your manual size and other subscriptions' size stay); a whole-position close is sent as `close_position`. Each close waits up to 30 s for the copy ledger to catch up; if it doesn't, that market is skipped.
+   `close_open_positions=false` (Hyperliquid leads only) skips the closes: the copied size stays open as an ordinary position on the follower account (it leaves `/v2/copy/positions`, and lead closes no longer reduce it). For a Strike lead it returns `400 close_open_positions=false is only supported when copying a Hyperliquid trader` before anything is stopped (the profit share is settled on the stop-time PnL).
 3. Resting copy orders are **not** canceled (a `cancel_open_orders` query is ignored).
 4. Fixed-ratio reservation is released; a Strike-lead profit share is attempted (below).
 
-If any close fails the response is `500 internal server error` although the subscription is already stopped -- **call DELETE again**: on a stopped subscription it re-runs the close (idempotent) and returns 204. Unknown id → `404 copy subscription not found`; non-UUID id → `500`.
+If any close fails the response is `500 internal server error` although the subscription is already stopped -- **call DELETE again** (closing): on a stopped subscription it re-runs the close (idempotent) and returns 204. A repeat with `close_open_positions=false` on a stopped subscription returns `404` instead, so kept positions are never closed. Unknown id → `404 copy subscription not found`; non-UUID id → `500`.
 
 ---
 
@@ -169,7 +170,7 @@ If any close fails the response is `500 internal server error` although the subs
 - Hyperliquid fills in one received batch are merged per (coin, order id, block time, open/close) before per-subscription sizing, in both modes: openings, and reductions that carry the lead's start position, become one copy; flips pass through unmerged.
 - An entry must pass the market's order rules (min/max size, step, min notional) or it is skipped. The engine can still reject the market IOC on margin (`insufficient_balance` etc.); the subscription stays active either way.
 
-**Reductions** close the same fraction of *this subscription's* copied size that the lead closed of its position: `follower close = attributed size × (lead fill size / lead position before fill)` (capped at 100%; partial closes round down; a full close takes the exact attributed size, as `close_position` when it is your whole position). Never balance-checked; mirrored even for excluded markets. Lead liquidations/ADL/backstop closes count as reductions. If the lead's pre-fill position is unknown, `fixed_amount` falls back to its entry formula clamped to your copied size, while `fixed_ratio` does not place the close (it is retried). Reductions are skipped when you hold no copied position for that subscription.
+**Reductions** close the same fraction of *this subscription's* copied size that the lead closed of its position: `follower close = attributed size × (lead fill size / lead position before fill)` (capped at 100%; partial closes round down; a full close takes the exact attributed size, as `close_position` when it is your whole position). Never balance-checked; mirrored even for excluded markets. Lead liquidations/ADL/backstop closes count as reductions. If the lead's pre-fill position is unknown, `fixed_amount` falls back to its entry formula clamped to your copied size, while `fixed_ratio` does not place the close (it is retried). Reductions are skipped when you hold no copied position for that subscription. Before sizing a reduction, the subscription's own earlier copy orders on that market must land (fill applied to the copy ledger, or ended with nothing filled) and the ledger must catch up with the engine; each wait lasts up to 30 s, after which the reduction is skipped (logged only). This is what lets a lead that opens and closes within seconds be mirrored on both legs.
 
 **Caps and filters** (entries only, both platforms): `max_margin_per_symbol` / `max_margin_total` count margin held by the subscription (isolated balance or cross initial margin share), margin of entries still in flight (~1 minute), and the new entry (`margin_per_entry_order`, or notional ÷ your leverage). An entry that would exceed a cap is skipped whole. `excluded_symbols` blocks entries only; on a lead flip the close leg is mirrored and the open leg skipped.
 
@@ -317,7 +318,7 @@ For a Strike lead (auth required; `sub_account_id` optional). Query `days`: defa
   ]
 }
 ```
-Leads with ≥ 1 active subscription; `follower_count` counts active subscriptions. `nickname`, `avatar_url` and the discovery fields are omitted when unknown (`copy_score` string).
+Leads with ≥ 1 active subscription; `follower_count` counts active subscriptions. `nickname` (Strike profile, or the Hyperliquid display name), `avatar_url` and the discovery fields are omitted when unknown (`copy_score` string).
 
 ### GET /v2/copy/leaderboard (public)
 
@@ -356,7 +357,7 @@ One row per person (sub-account copies roll up to the owning master). Order: act
 | Param | Default | Values |
 |---|---|---|
 | `platform` | `hyperliquid` | `hyperliquid` \| `strike` \| `all` (merged by sort) |
-| `search` | | `0x…` hex prefix (≤ 42 chars) matches Hyperliquid addresses (forces enriched only) and Strike wallets; other text matches Strike account id/wallet prefix, nickname, ADA handle only |
+| `search` | | Case-insensitive. `0x…` hex prefix (≤ 42 chars) matches Hyperliquid addresses (forces enriched only) and Strike wallets by prefix; other text matches Hyperliquid display names and Strike nicknames / ADA handles anywhere in the name, and Strike account ids / wallets by prefix |
 | `sort` / `order` | `pnl_30d` / `desc` | `pnl_*`, `roi_*`, `volume_*` (`1d`,`7d`,`30d`,`all`), `equity`, `copy_score`, `max_drawdown` / `asc` |
 | `top` + `rank_by` | / `pnl_30d` | Global rank cutoff 1–10000, applied before filters; `pnl_30d` \| `equity` \| `volume_30d` |
 | `asset` / `assets`, `assets_mode` | / `any` | CSV; `any` \| `only` (legacy `all`) |
@@ -390,7 +391,7 @@ Any invalid value → `400 invalid copy trader discovery query`; discovery off �
 }
 ```
 
-- **`address`**: for `platform: "hyperliquid"` the trader's Hyperliquid wallet (an external trader; copy it with `platform: "hyperliquid"`); for `platform: "strike"` the Strike **account_id**, with the owner's wallet in `blockchain_address` and the nickname in `display_name` (use `address` as `lead_account_id`; vaults are never listed). `avatar_url`, `ada_handle` only for Strike rows.
+- **`address`**: for `platform: "hyperliquid"` the trader's Hyperliquid wallet (an external trader; copy it with `platform: "hyperliquid"`); for `platform: "strike"` the Strike **account_id**, with the owner's wallet in `blockchain_address` (use `address` as `lead_account_id`; vaults are never listed). `display_name` is the Hyperliquid display name or Strike nickname, omitted when none. `avatar_url`, `ada_handle` only for Strike rows.
 - `top_assets[].symbol` is the Strike market, `""` when not copyable. `copy_amount_coverage` (fixed ratio: share of the lead's opening notional a given `copy_amount` could have copied under Strike order rules) and `peak_concurrent_entries` × margin per entry (fixed amount: estimated margin need over `fills_window_days`) are historical guidance; both can be empty/omitted. Score fields are omitted/`{}` when unavailable.
 - `total` counts all matches (after `top` and filters, before `cursor`/`limit`); `next_cursor` is omitted on the last page.
 
@@ -409,7 +410,7 @@ Any invalid value → `400 invalid copy trader discovery query`; discovery off �
 
 | Object | States |
 |---|---|
-| Subscription | `active` → `stopped` (DELETE, or stop loss with `stop_reason: "stop_loss"`). Follower liquidation/ADL does **not** stop it; to copy again, subscribe again |
+| Subscription | `active` → `stopped` (DELETE, or stop loss with `stop_reason: "stop_loss"`; stop loss always closes). Follower liquidation/ADL does **not** stop it; to copy again, subscribe again |
 | Managed setup | `creating_account` → `funding` → `active`; failures `failed`, `refunding` → `refunded` \| `refund_failed`; `stopped` once its subscription stopped |
 | Copy order row | `pending` → `placed` \| `failed`; `placed` → `canceled` (stop-loss cancel) |
 | Profit share | on stop with `closed_pnl > 0` (Strike lead): transfer pending → confirmed (`closed_pnl` reduced) |
@@ -417,7 +418,8 @@ Any invalid value → `400 invalid copy trader discovery query`; discovery off �
 ## Gotchas
 
 - `platform` defaults to `strike`; Hyperliquid wallets need `platform: "hyperliquid"`. `/v2/copy/discover` defaults to `platform=hyperliquid`.
-- `DELETE` can return `500` after it already stopped the copy (a close failed or the ledger lagged): retry it until `204`.
+- `DELETE` can return `500` after it already stopped the copy (a close failed or the ledger lagged): retry it (without `close_open_positions=false`) until `204`.
+- `close_open_positions=false` works only for Hyperliquid leads; the kept size is then yours to manage.
 - Subscribe/PATCH only change the subscription; copies happen asynchronously as the lead trades. A skipped live copy (balance, rules, caps, excluded symbol) is only logged, except cap/ledger skips and placement failures, which appear as `failed` rows.
 - The fixed-ratio reservation does not stop *your* manual orders from using that margin; it only lowers reported available/withdrawable balance and new-copy checks.
 - `max_margin_per_symbol: 0` / `max_margin_total: 0` on subscribe is `400` (omit instead); on PATCH `0` clears.

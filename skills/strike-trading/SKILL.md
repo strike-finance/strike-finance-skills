@@ -1,6 +1,6 @@
 ---
 name: strike-trading
-description: Strike Finance order management -- create, cancel, replace and batch orders, symbol-level quote replace, bracket TP/SL strategies, trailing stops, TWAP, leverage, margin mode, isolated margin, open-order reads. Use when building trading bots, market makers or order interfaces.
+description: Strike Finance order management -- create, cancel, replace and batch orders, symbol-level quote replace, bracket TP/SL strategies, trailing stops, ALO (post-only) and self-trade prevention modes, request guards, TWAP, leverage, margin mode, isolated margin, open-order reads. Use when building trading bots, market makers or order interfaces.
 ---
 
 # Strike Finance Trading
@@ -12,14 +12,15 @@ Order/fill history (`/v2/history/order`, `/v2/history/fill`) is in **strike-hist
 
 ## How it works
 
-- **Async.** Writes are sequenced to the matching engine and answered before the engine runs them. `201 {"status":"pending"}` means accepted, not resting or filled. Engine rejections (margin, tick/step size, post-only cross, ...) arrive on the user stream (`wss://<host>/ws/user-api`, **strike-userstream**) as `ORDER_TRADE_UPDATE` with the reason code; match on client order ID `c`. The order is also readable via `GET /v2/order?symbol=..&client_order_id=..` (rejected orders included, except the silently dropped ones below).
+- **Async.** Writes are sequenced to the matching engine and answered before the engine runs them. `201 {"status":"pending"}` means accepted, not resting or filled. Engine rejections (margin, tick/step size, ALO cross, ...) arrive on the user stream (`wss://<host>/ws/user-api`, **strike-userstream**) as `ORDER_TRADE_UPDATE` with the reason code; match on client order ID `c`. The order is also readable via `GET /v2/order?symbol=..&client_order_id=..` (rejected orders included, except the silently dropped ones below).
+- **Engine progress.** Public `GET /v2/_status` → `{"timestamp": <ms>, "head_sequence_id": N, "commit_sequence_id": M}` (cached 50 ms; `?refresh=true` bypasses; `503 {"error":"status unavailable"}`). Once `commit_sequence_id >= ` a response's `sequence_id`, the engine has processed that command (not necessarily placed or filled it) — read the order after that instead of guessing a delay.
 - **Silently dropped commands.** Some rejects happen before an order event exists: the API still answers `201`/`200`, but no user-stream update follows and `GET /v2/order` returns `404`. On `POST /v2/order` and `/v2/orders/batch` items: unknown `symbol`, bad `slippage`, market not open (`order_not_allowed`), trading halted (`circuit_breaker`), and — batch items only — a missing `side`/`type`. On `/v2/order/strategy`: unknown symbol, `order_not_allowed`, a reused `strategy_id`. On the replace endpoints an unknown symbol or a create missing `side`/`type` drops the whole command (no cancels either), while bad `slippage` is a sync `400`. Validate these client-side and treat "no event within a few seconds" as a failure.
 - **Errors** are `{"error": "<message>"}` (some add `failed_index`, `max_leverage`/`requested`). Binding failures return Go validator text, e.g. `Key: 'CreateOrderRequest.Side' Error:Field validation for 'Side' failed on the 'required' tag`. Binding does **not** enforce `required` on decimal fields (`size`, `amount`, leg `stop_price`) or on items inside arrays (`orders[]`, `replacements[]`): a missing `size` is accepted and rejected by the engine as `order_less_than_min_size`; a missing `side`/`type` in an array item is silently dropped (above).
-- **Decimals** are strings in responses; requests accept strings or numbers. Omit optional fields instead of sending `""` — an empty string for an enum or decimal (`"time_in_force": ""`, `"price": ""`) is a `400`. Unknown fields are ignored silently.
-- **Enums are case-sensitive**: `side` `buy`/`sell`, `type` lowercase, `time_in_force` `GTC`/`IOC`/`FOK`, `working_type` `mark_price`/`contract_price`. TWAP uses `BUY`/`SELL`.
-- **No idempotency.** `client_order_id` is not unique-checked for single creates; a blind retry can double-place. After a timeout, look the order up by `client_order_id` first.
+- **Decimals** are strings in responses; requests accept strings or numbers. Omit optional fields instead of sending `""` — an empty string for an enum or decimal (`"time_in_force": ""`, `"price": ""`) is a `400`. `size`, `price`, `stop_price`, `callback_rate` and `activation_price` must be below `1e12` in absolute value (`400 order_amount_out_of_range`). Unknown fields are ignored silently.
+- **Enums are case-sensitive**: `side` `buy`/`sell`, `type` lowercase, `time_in_force` `GTC`/`IOC`/`ALO`, `stp_mode` `expire_maker`/`expire_taker`/`expire_both`, `working_type` `mark_price`/`contract_price`. TWAP uses `BUY`/`SELL`. `FOK` is retired: `400 Value "FOK" does not represent a OrderTimeInForce`.
+- **No idempotency.** `client_order_id` is not unique-checked for single creates; a blind retry can double-place. After a timeout, look the order up by `client_order_id` first. (Request guards below stop *stale* intents from landing after newer ones; they do not dedupe a retry.)
 - **Account selectors** (every write): `vault_id` (vault leader trades the vault; vault must be `active` for creates/replaces) or `sub_account_id` (master trades an owned active sub-account). They are mutually exclusive (`400`). API wallets bound to a sub-account already act as it. Vault `403` texts differ by route: `POST /v2/order` says `only vault leader can trade on vault account` / `vault trading is <status>`; cancel, replace, strategy, leverage, margin and TWAP say `only vault leader can perform this action on vault account` (replace/strategy: `vault is <status>`).
-- **Self-trade prevention** is automatic, expire-maker: an incoming order never fills against a resting order of the same account, the same master-account family, or the same server-assigned STP group. The resting order expires with `CloseReason` `order_expired_in_match`.
+- **Self-trade prevention** is always on: an incoming order never fills against a resting order of the same account, one placed by the same root account (a master, its sub-accounts, and vault orders that master places as leader), or one from the same server-assigned STP group. The incoming order's `stp_mode` decides what expires at the first such resting order: `expire_maker` (default) expires the resting remainder and keeps matching; `expire_taker` expires the incoming remainder and leaves the resting order; `expire_both` expires both remainders. The last two stop matching there (earlier fills stand) and never rest. Expired orders get `Status` `expired`, `CloseReason` `order_expired_in_match`; no self fill, fee or PnL.
 - **Rate limit**: per API wallet key, `429 {"error":"rate limit exceeded"}`.
 - **Clock**: signatures older than 3 minutes or from the future are `401 signature expired or invalid timestamp`. Sync against `GET /v2/time` on the API host (`{"serverTime": <ms>}`); the signing timestamp is in seconds.
 
@@ -58,6 +59,8 @@ export async function strike<T>(
 |---|---|---|
 | POST | `/v2/order` | Create order (201) |
 | GET | `/v2/order` | One order by `order_id` / `client_order_id` |
+| POST / DELETE | `/v2/_guards` | Acquire / delete request guards (optional) |
+| GET | `/v2/_status` | Engine progress (public) |
 | GET | `/v2/openOrders` | Pending / open / untriggered orders |
 | DELETE | `/v2/order/cancel` | Cancel one order |
 | DELETE | `/v2/order/cancel-all` | Cancel all (or one symbol) |
@@ -86,17 +89,19 @@ export async function strike<T>(
 | `size` | decimal, required | Base asset. Not checked at bind time — a missing `size` becomes an engine `order_less_than_min_size` reject |
 | `price` | decimal | Limit price (`limit`; post-trigger price for `stop_limit` / `take_profit_limit`) |
 | `stop_price` | decimal | Trigger, required > 0 for stop / take-profit types (sync `400 invalid_stop_price`) |
-| `time_in_force` | | `GTC` (default) \| `IOC` \| `FOK` |
+| `time_in_force` | | `GTC` (default) \| `IOC` \| `ALO` (add-liquidity-only = post-only). `ALO` only on `limit`, `stop_limit`, `take_profit_limit` (else `400 ALO requires limit, stop_limit, or take_profit_limit order type`) and only with `stp_mode` `expire_maker` (`400 ALO requires expire_maker stp_mode`) |
+| `stp_mode` | | `expire_maker` (default) \| `expire_taker` \| `expire_both` — see self-trade prevention above |
 | `working_type` | | Trigger price source. Default `mark_price`; trailing stops default `contract_price` (last trade) |
-| `post_only` | bool | Rejected with `order_would_match_immediately` if it would take |
+| `post_only` | bool | Alias for `ALO`: `true` with `time_in_force` omitted/`GTC` makes the order `ALO`; with `IOC` it is `400 post_only requires GTC or ALO time_in_force`. The ALO type/STP rules above then apply (so `post_only` on a `market`/`stop`/`take_profit`/trailing order is a `400`). A crossing ALO order is rejected `order_would_match_immediately` |
 | `reduce_only` | bool | Only reduces; size clamped to the position |
 | `close_position` | bool | Sized to the whole position on execution; skips min-size checks |
 | `price_protect` | bool | Conditional won't trigger while last/mark deviation exceeds the market's `trigger_protect` |
 | `callback_rate` | decimal | Trailing only, required, `"0.1"`–`"5"` percent |
 | `activation_price` | decimal | Trailing only. Omit to start trailing immediately at the working price |
 | `slippage` | decimal | Market only, fraction (`"0.01"` = 1%) from book mid; tighter of this and the market bound applies |
-| `client_order_id` | string | ≤ 256 chars; UUIDv7 generated if omitted. Reserved prefixes rejected: `copy:`, `liq_`, `bankrupt_`, `adl_`, `if_transfer_`, `if_adl_`, `vault_wd_` |
+| `client_order_id` | string | ≤ 254 bytes (`400 client_order_id must be at most 254 bytes`); UUIDv7 generated if omitted. Reserved prefixes rejected: `copy:`, `liq_`, `bankrupt_`, `adl_`, `if_transfer_`, `if_adl_`, `vault_wd_` |
 | `vault_id` / `sub_account_id` | string | Account selector (see above) |
+| `guard` | object | Optional `{ "id": "<uuid>", "counter": <uint64 > 0> }`, see Request guards |
 
 There is no per-order leverage or margin mode; set them with `/v2/leverage`, `/v2/marginMode` or `PUT /v2/symbols`.
 
@@ -104,7 +109,7 @@ How types execute:
 
 | Type | On trigger / execution |
 |---|---|
-| `limit` | Rests (GTC) or `IOC` expires the remainder / `FOK` expires unless fully fillable |
+| `limit` | Rests (`GTC`/`ALO`) or `IOC` expires the remainder. `ALO` that would cross is rejected before any fill or STP expiry |
 | `market` | Takes; unfilled remainder canceled (`market_order_exceeded_slippage` if the bound stopped it) |
 | `stop`, `take_profit` | Become `market`; `OriginType` keeps the original type |
 | `stop_limit`, `take_profit_limit` | Become `limit` at `price` |
@@ -112,7 +117,7 @@ How types execute:
 
 Trigger direction: `stop*` sell fires at price ≤ `stop_price`, buy at ≥; `take_profit*` sell at ≥, buy at ≤. A conditional that would fire immediately is rejected (`conditional_order_triggers_immediately`), as is a trailing `activation_price` already crossed.
 
-**Builder fee** — header `X-Builder-Fee-Bps: <0-100>` (bps of fill notional, 100 = 1%) when the API wallet has a builder code. Must be ≤ the builder's `fee_share_bps` and ≤ the account's approved max, else `400` (e.g. `X-Builder-Fee-Bps 50 exceeds your approved max of 20`); nothing is placed. For builder wallets the builder must be active and approved even with no header. Approval is looked up on the calling account, or on `sub_account_id` when one is sent — never on a vault (vault trades use the leader's approval). Builder connect only approves the wallet's own (master) account, so a builder-code wallet sending `sub_account_id` gets `400 account has not approved builder "<code>"` unless that sub-account approved the builder. Honored by `/v2/order`, `/v2/orders/batch`, `/v2/orders/replace`, `/v2/order/replace-batch`, `/v2/order/strategy` (all legs). **Not** by `/v2/order/replace` (its replacement order carries no builder code at all — no builder fee, no attribution), nor by TWAP, grid bot or copy-trading orders, which never carry a builder code.
+**Builder fee** — header `X-Builder-Fee-Bps: <0-100>` (bps of fill notional, 100 = 1%) when the API wallet has a builder code. Must be ≤ the builder's `fee_share_bps` and ≤ the account's approved max, else `400` (e.g. `X-Builder-Fee-Bps 50 exceeds your approved max of 20`); nothing is placed. For builder wallets the builder must be active and approved even with no header. Approval is looked up on the calling account, or on `sub_account_id` when one is sent; a sub-account without its own approval inherits its master's (and its max). Never on a vault: vault trades use the leader's approval. At fill time the fee is `floor(notional × bps / 10000, 8 dp)`, capped at what the payer can cover, and `0` when the builder's own account is the trader (details in **strike-calculations**). Honored by `/v2/order`, `/v2/orders/batch`, `/v2/orders/replace`, `/v2/order/replace-batch`, `/v2/order/strategy` (all legs). **Not** by `/v2/order/replace` (its replacement order carries no builder code at all — no builder fee, no attribution), nor by TWAP, grid bot or copy-trading orders, which never carry a builder code.
 
 **Response 201:**
 ```json
@@ -126,7 +131,7 @@ Trigger direction: `stop*` sell fires at price ≤ `stop_price`, buy at ≥; `ta
 }
 ```
 
-Sync errors: `400` (binding, reserved prefix, builder fee, `invalid_stop_price`, `vault_id and sub_account_id are mutually exclusive`), `401`, `403` (`only vault leader can trade on vault account`, `vault trading is <status>`, `sub-account access denied`), `404` (`account not found`, `vault not found`).
+Sync errors: `400` (binding incl. unknown enum values, reserved prefix / over-long `client_order_id`, builder fee, `invalid_stop_price`, `order_amount_out_of_range`, the ALO / `post_only` rules above, `vault_id and sub_account_id are mutually exclusive`), `401`, `403` (`only vault leader can trade on vault account`, `vault trading is <status>`, `sub-account access denied`), `404` (`account not found`, `vault not found`), `409` (request guard, below).
 
 #### Engine reject / close reasons (`CloseReason`, user stream)
 
@@ -139,7 +144,7 @@ Sync errors: `400` (binding, reserved prefix, builder fee, `invalid_stop_price`,
 | `order_price_out_of_price_cap`, `order_price_out_of_price_floor` | Limit price too far from mark (`order_limit_price_bound`) |
 | `stop_price_out_of_limit`, `stop_price_not_multiple_of_tick` | Stop price range / tick |
 | `conditional_order_triggers_immediately` | Trigger or activation price already crossed |
-| `order_would_match_immediately` | Post-only would take |
+| `order_would_match_immediately` | `ALO` / `post_only` order would take (including against your own resting order) |
 | `insufficient_balance`, `position_notional_exceed` | Margin / tier notional cap |
 | `no_open_position`, `order_increase_position`, `order_reduce_only_reject` | Reduce-only with no position, wrong side, or no reducible size left |
 | `invalid_callback_rate`, `invalid_activation_price`, `trailing_stop_requires_reduce_only`, `trailing_stop_close_position_unsupported` | Trailing stop rules |
@@ -147,10 +152,10 @@ Sync errors: `400` (binding, reserved prefix, builder fee, `invalid_stop_price`,
 | `market_order_exceeded_slippage` | Market remainder canceled at the slippage bound |
 | `order_not_allowed`, `market_reduce_only` | Market not open for new orders / reduce-only market. `order_not_allowed` is silently dropped on `/v2/order`, batch and strategy (an event only on replace endpoints) |
 | `liquidation`, `circuit_breaker` | Account in liquidation (reduce-only mode) / trading halted. `circuit_breaker` is silently dropped on `/v2/order` and batch (an event only on replace endpoints) |
-| `order_expired_in_match` | Your resting order expired by self-trade prevention |
+| `order_expired_in_match` | Expired by self-trade prevention: your resting order (`expire_maker`, `expire_both`) or the incoming remainder (`expire_taker`, `expire_both`) |
 | `order_strategy_secondary_oco`, `order_strategy_primary_closed`, `position_closed` | Bracket leg expired by OCO / primary closed / reduce-only order canceled when the position closed or flipped |
 
-Market rule fields are the engine's own market config, served by `GET /v2/markets` on the API host (**strike-market-data**). Don't take tick/lot filters from `/price/v2/exchangeInfo`.
+Market rule fields are the engine's own market config, served by `GET /v2/markets` on the API host (**strike-account**). Don't take tick/lot filters from `/price/v2/exchangeInfo`.
 
 ---
 
@@ -160,7 +165,7 @@ Query: `symbol` (required), `order_id` or `client_order_id` (client ID wins). Pu
 
 Errors: `400 symbol parameter is required`, `400 either order_id or client_order_id parameter is required`, `400 invalid order_id format`, `401 authentication required or provide vault_id, account_id, or blockchain_address`, `404 order not found`, `404 account not found`.
 
-Response keys are **PascalCase** (engine model). `Strategy`, `Trailing`, `Builder`, `STPGroup`, `STPAccountID`, `CopySubscriptionID`, `CopyLeadOrderID` are omitted when unset:
+Response keys are **PascalCase** (engine model) except `stp_mode`. `Strategy`, `Trailing`, `Builder`, `STPGroup`, `STPAccountID`, `CopySubscriptionID`, `CopyLeadOrderID` are omitted when unset:
 
 ```json
 {
@@ -175,6 +180,7 @@ Response keys are **PascalCase** (engine model). `Strategy`, `Trailing`, `Builde
   "OriginType": "",
   "AutoCloseType": "",
   "TimeInForce": "GTC",
+  "stp_mode": "expire_maker",
   "WorkingType": "contract_price",
   "Size": "0.1",
   "Filled": "0",
@@ -193,7 +199,7 @@ Response keys are **PascalCase** (engine model). `Strategy`, `Trailing`, `Builde
 }
 ```
 
-`WorkingType` is `none` for non-conditional orders; `OriginType`/`AutoCloseType` are `""` unless set. Bracket orders carry `"Strategy": { "ID": "<strategy_id>", "IsPrimary": true|false }`. A triggered trailing stop shows `Type: "market"`, `OriginType: "trailing_stop_market"` and keeps `Trailing`.
+`TimeInForce` is `GTC` / `IOC` / `ALO`; closed orders placed before the FOK retirement can still read `FOK`. `PostOnly` is derived: `true` exactly when `TimeInForce` is `ALO`. `stp_mode` is always present. `WorkingType` is `none` for non-conditional orders; `OriginType`/`AutoCloseType` are `""` unless set. Terminal orders served from history report `BoundPrice` `"0"` and omit `Builder`, `STPGroup`, `STPAccountID` and the copy fields. Bracket orders carry `"Strategy": { "ID": "<strategy_id>", "IsPrimary": true|false }`. A triggered trailing stop shows `Type: "market"`, `OriginType: "trailing_stop_market"` and keeps `Trailing`.
 
 ### GET /v2/openOrders — Open Orders
 
@@ -208,7 +214,7 @@ With `scope=all` adds `"accounts": [{ "account_id": "...", "name": "...", "kind"
 
 ### DELETE /v2/order/cancel
 
-Body (JSON on DELETE — the signature covers its hash): `{ "symbol": "BTC-USD", "order_id": 33428500 }` or `{ "symbol": "BTC-USD", "client_order_id": "my-order-001" }`, plus optional `vault_id` / `sub_account_id`. `order_id` is a JSON number.
+Body (JSON on DELETE — the signature covers its hash): `{ "symbol": "BTC-USD", "order_id": 33428500 }` or `{ "symbol": "BTC-USD", "client_order_id": "my-order-001" }`, plus optional `vault_id` / `sub_account_id` / `guard`. `order_id` is a JSON number.
 
 ```json
 { "order_id": 33428500, "client_order_id": "my-order-001", "symbol": "BTC-USD", "sequence_id": 70804201, "message_id": "1775914565490-0" }
@@ -217,7 +223,7 @@ Body (JSON on DELETE — the signature covers its hash): `{ "symbol": "BTC-USD",
 
 ### DELETE /v2/order/cancel-all
 
-Body `{}` (all symbols) or `{ "symbol": "BTC-USD" }`; an empty body is `400 {"error":"EOF"}`. Cancels open, pending and untriggered orders (TP/SL included).
+Body `{}` (all symbols) or `{ "symbol": "BTC-USD" }` (plus optional `vault_id` / `sub_account_id` / `guard`); an empty body is `400 {"error":"EOF"}`. Cancels open, pending and untriggered orders (TP/SL included).
 
 **Bot orders on the same account are canceled too.** Grid bot orders (`client_order_id` `<bot_id>:grid-<n>:entry|:tp|:sl`, bot IDs start with `grid-`) are not exempt: a canceled grid **entry** permanently removes that grid level, while a canceled grid TP/SL on a filled level is re-placed by the bot (see strike-grid-bot). Copy-trading orders (`copy:<subscription_id>:<lead_order_id>`) are always market IOC and never rest, so cancel-all does not affect them in practice. To spare bots, cancel your own orders by ID instead.
 
@@ -231,13 +237,13 @@ Body `{}` (all symbols) or `{ "symbol": "BTC-USD" }`; an empty body is `400 {"er
 ### POST /v2/orders/batch — Independent Creates
 
 ```json
-{ "orders": [ /* CreateOrder bodies, min 1 */ ], "vault_id": "optional", "sub_account_id": "optional" }
+{ "orders": [ /* CreateOrder bodies, min 1 */ ], "vault_id": "optional", "sub_account_id": "optional", "guard": "optional" }
 ```
-Each order is placed separately (own sequence ID, any symbol, no atomicity). Request-level failures reject the whole batch (binding errors, a reserved `client_order_id` prefix in any item, builder-fee errors, `vault_id` + `sub_account_id`, `403` sub-account ownership); once those pass the response is `200`:
+Each order is placed separately (own sequence ID, any symbol, no atomicity). Request-level failures reject the whole batch (binding errors, a reserved prefix or over-long `client_order_id` in any item, builder-fee errors, `vault_id` + `sub_account_id`, `403` sub-account ownership, guard errors); once those pass the response is `200`:
 ```json
 { "successful": [ /* CreateOrder responses */ ], "failed": [ { "index": 1, "error": "invalid_symbol" } ] }
 ```
-`successful` / `failed` are `null` (not `[]`) when empty. `failed` only holds per-item API-side failures (e.g. `invalid_symbol` for an empty symbol, vault errors); engine rejections come on the user stream, and silently-dropped items (above) still appear in `successful`. Items are not field-validated at bind time.
+`successful` / `failed` are `null` (not `[]`) when empty. `failed` only holds per-item API-side failures — the sync `400`s of a single create (e.g. `invalid_symbol` for an empty symbol, `invalid_stop_price`, the ALO / `post_only` rules, `order_amount_out_of_range`) and vault errors; engine rejections come on the user stream, and silently-dropped items (above) still appear in `successful`. Items are not field-validated at bind time.
 
 ### Replace endpoints (one engine command each)
 
@@ -253,8 +259,9 @@ Rules:
 - Array items are not field-validated at bind time; an unknown symbol or a create missing `side`/`type` drops the whole command silently (no cancels, no events).
 - Max 1000 operations (cancels + creates; cancel-all counts 1). Duplicate `client_order_id` in one request → `400 duplicate_request_id`.
 - If any create fails **static** market rules (size/step, tick, price range/bound, min notional), **nothing** is applied — no cancels — and that create is published as `rejected`.
-- Otherwise cancels apply first, then creates in order; the first create rejected for another reason (margin, post-only cross, ...) **stops** the batch and later creates are skipped with no order event (`conditional_order_triggers_immediately` does not stop it).
-- On replace-batch, per-item build errors (missing legs, vault mismatch, `order_id_not_set`, symbol errors) return `400 {"error": "...", "failed_index": i}`. Command-level errors (`duplicate_request_id`, `invalid_stop_price`, slippage errors, `batch_replace_orders: total operations exceed 1000`) and binding errors are plain `{"error"}`; the other two replace routes never add `failed_index`.
+- Otherwise cancels apply first, then creates in order; the first create rejected for another reason (margin, reduce-only, `circuit_breaker`, `order_not_allowed`, ...) **stops** the batch and later creates are skipped with no order event. Two rejects do not stop it: `conditional_order_triggers_immediately` and an ALO cross (`order_would_match_immediately`) — so a crossed quote does not cost you the rest of the ladder.
+- A `guard` goes at the top level only; one on a leg, item or `orders[]` entry is a `400` (`guard must be on the ...`).
+- On replace-batch, per-item build errors (missing legs, vault mismatch, `order_id_not_set`, symbol errors, `post_only requires GTC or ALO time_in_force`) return `400 {"error": "...", "failed_index": i}`. Command-level errors (`duplicate_request_id`, `invalid_stop_price`, `order_amount_out_of_range`, the ALO type/STP rules, slippage errors, `batch_replace_orders: total operations exceed 1000`) and binding errors are plain `{"error"}`; the other two replace routes never add `failed_index`.
 
 Responses:
 ```json
@@ -268,6 +275,19 @@ Responses:
 { "sequence_id": 70804205, "message_id": "...", "account_id": "...", "symbol": "BTC-USD",
   "cancel_all": true, "new_orders": [ { "client_order_id": "...", "account_id": "...", "symbol": "BTC-USD", "status": "pending" } ] }
 ```
+
+---
+
+### Request guards (optional) — POST / DELETE /v2/_guards
+
+For bots with several senders (threads, processes, hosts) on one account: a guard makes the API refuse an order command whose counter is not newer than one already admitted on that guard, so a delayed quote refresh cannot land after a newer one. Single-sender bots don't need it. It is not idempotency, a lock, or order ownership.
+
+- **Acquire**: `POST /v2/_guards` `{"count": 3}` (1–128) → `{"account_id": "...", "guard_ids": ["019a...", ...], "idle_ttl_seconds": 3600}`. Bound to the authenticated account (no `vault_id`/`sub_account_id`); one guard covers commands for that account, its sub-accounts and the vaults it leads. `404 account not found`.
+- **Use**: top-level `"guard": {"id": "<guard_id>", "counter": 42}` on `POST /v2/order`, `/v2/orders/batch`, `/v2/orders/replace`, `/v2/order/replace`, `/v2/order/replace-batch`, `/v2/order/strategy`, `DELETE /v2/order/cancel`, `/v2/order/cancel-all`. `counter` is a positive JSON integer (uint64; stay below 2^53 in JavaScript), strictly greater than the highest counter admitted on that guard; gaps are fine. One request (a whole batch included) uses one counter. A guard nested in an item or leg is a `400`; a guarded batch's items must not name a different `sub_account_id` (`400 guarded batch orders must use the endpoint sub-account`).
+- **Errors** (nothing published): `409 guard is missing, expired or evicted for this account`, `409 guard counter must be greater than the last admitted counter`. A bad `id`/`counter` is a binding `400`.
+- **Lifetime**: 1 h idle TTL, renewed by each admitted request. At most 128 active guards per account; acquiring beyond that evicts the oldest-acquired. Expiry and eviction never cancel orders.
+- An admitted counter can stay consumed even if the publish then fails (`500`); after an unknown outcome reconcile by `client_order_id` and continue with a higher counter. Counters are compared only within one guard.
+- **Delete**: `DELETE /v2/_guards` `{"ids": ["<guard_id>", ...]}` (1–128 UUIDs) → `{"deleted": 2}`; unknown, expired or foreign IDs are no-ops.
 
 ---
 
@@ -286,10 +306,12 @@ Responses:
   "sl_order": { "type": "stop", "size": "0.1", "stop_price": "48000", "working_type": "mark_price" }
 }
 ```
-- `strategy_id` (yours) is required; at least one of `tp_order` / `sl_order` (`400 at least one of tp_order or sl_order must be provided`).
+- `strategy_id` (yours, ≤ 254 bytes, else `400 invalid_strategy_id`) is required; at least one of `tp_order` / `sl_order` (`400 at least one of tp_order or sl_order must be provided`).
 - Primary takes the CreateOrder fields except `callback_rate`, `activation_price`, `slippage` — those are not part of this body and are **silently ignored** if sent (so no trailing primary, no slippage bound).
-- Leg fields: `type`, `size`, `stop_price` (required, > 0 — missing or ≤ 0 is `400 invalid_stop_price`), optional `client_order_id`, `price`, `time_in_force`, `working_type`, `post_only`, `price_protect`. Legs are placed on the opposite side with `reduce_only` forced.
+- Leg fields: `type`, `size`, `stop_price` (required, > 0 — missing or ≤ 0 is `400 invalid_stop_price`), optional `client_order_id`, `price`, `time_in_force`, `stp_mode`, `working_type`, `post_only`, `price_protect`. Legs are placed on the opposite side with `reduce_only` forced. The ALO / `post_only` rules apply per order (ALO only on a `take_profit_limit` / `stop_limit` leg), and `stp_mode` is per order: an omitted leg mode is `expire_maker`, not the primary's.
 - `tp_order.type` ∈ `take_profit`/`take_profit_limit`, `sl_order.type` ∈ `stop`/`stop_limit`; with both legs, TP `stop_price` ≥ SL `stop_price` for a buy primary (≤ for sell). Violations: `400 invalid_secondary_order`.
+- A leg that breaks the market's rules (price range, tick, min size, ...) rejects the whole strategy: the **primary** is published `rejected` with that leg's code as `CloseReason` (legs get no event).
+- `guard` goes on the top level only (`400 guard must be on the strategy request, not its order legs`).
 - Lifecycle: legs stay `pending` until the primary fills, then become `untriggered`. One leg triggering expires the other (`order_strategy_secondary_oco`); a primary that closes unfilled expires the legs (`order_strategy_primary_closed`).
 
 ```json
@@ -317,9 +339,10 @@ Applies to the open position too (initial margin recomputed). Async engine rejec
 
 GET (auth required; `vault_id` / `sub_account_id` query):
 ```json
-{ "default_margin_mode": "cross", "default_leverage": 20,
+{ "default_margin_mode": "cross", "default_leverage": null,
   "symbol_settings": { "BTC-USD": { "margin_mode": "cross", "leverage": 20 } } }
 ```
+`default_leverage` is `null` until the account saves one; `symbol_settings` then falls back to each market's `default_leverage` (capped at the market max).
 `vault_id` here is leader-only (`403 only vault leader can perform this action on vault account`, `404 vault not found`); `400 vault_id and sub_account_id are mutually exclusive`; `401 account_id not found in auth context` without auth.
 
 PUT takes the same keys (all optional) plus `vault_id` / `sub_account_id` and returns **204** with no body. Disallowed per-symbol changes are skipped silently (mode change with position or orders, leverage decrease with a position, above market max); unknown symbols ignored. Like `/v2/marginMode`, engine-side refusals produce no event — re-read `GET /v2/symbols`. `400 invalid margin mode`, `400 invalid leverage` (default above the highest market max).
@@ -366,10 +389,16 @@ DELETE (query `vault_id` / `sub_account_id` if needed) → `{ "strategy_id": "..
 ## Examples
 
 ```typescript
-// Post-only bid
+// Post-only (ALO) bid; post_only: true is the same thing
 await strike("POST", "/v2/order", {
   client_order_id: `bid-${Date.now()}`, symbol: "BTC-USD", side: "buy",
-  type: "limit", size: "0.1", price: "50000", post_only: true,
+  type: "limit", size: "0.1", price: "50000", time_in_force: "ALO",
+});
+
+// IOC that must not trade into your own resting quotes: expire this order instead of them
+await strike("POST", "/v2/order", {
+  symbol: "BTC-USD", side: "buy", type: "limit", size: "0.1", price: "50100",
+  time_in_force: "IOC", stp_mode: "expire_taker",
 });
 
 // Market sell, 1% max slippage, 10 bps builder fee
@@ -385,13 +414,17 @@ await strike("POST", "/v2/order", {
   callback_rate: "1.5", activation_price: "67000", reduce_only: true,
 });
 
-// Market maker: replace the whole quote set on one symbol atomically
+// Market maker: replace the whole quote set on one symbol atomically,
+// guarded so an older refresh from another sender can't land after this one
+const { guard_ids } = await strike<{ guard_ids: string[] }>("POST", "/v2/_guards", { count: 1 });
+let counter = 0;
 await strike("POST", "/v2/orders/replace", {
   symbol: "BTC-USD",
   orders: [
-    { client_order_id: "q-bid-1", side: "buy",  type: "limit", size: "0.2", price: "49990", post_only: true },
-    { client_order_id: "q-ask-1", side: "sell", type: "limit", size: "0.2", price: "50010", post_only: true },
+    { client_order_id: "q-bid-1", side: "buy",  type: "limit", size: "0.2", price: "49990", time_in_force: "ALO" },
+    { client_order_id: "q-ask-1", side: "sell", type: "limit", size: "0.2", price: "50010", time_in_force: "ALO" },
   ],
+  guard: { id: guard_ids[0], counter: ++counter },
 });
 
 // Cancel by client ID, then confirm state
@@ -415,7 +448,7 @@ await strike("POST", "/v2/algo/twap", { symbol: "BTC-USD", side: "BUY", total_si
 | `filled` | Fully executed |
 | `canceled` | Canceled by user/system, or market remainder canceled |
 | `rejected` | Failed engine validation — see `CloseReason` |
-| `expired` | IOC/FOK remainder, OCO leg, or resting order removed by self-trade prevention |
+| `expired` | IOC remainder, OCO leg, or remainder expired by self-trade prevention (`order_expired_in_match`) |
 
 ## Auto Close Types (`AutoCloseType`, system orders)
 
@@ -430,5 +463,5 @@ await strike("POST", "/v2/algo/twap", { symbol: "BTC-USD", side: "BUY", total_si
 
 ## Notes
 
-- Direct Market Access (`direct-eu.strikefinance.org`) is provisioned by Strike per API wallet (IP allowlist + scopes). It serves only: `POST /v2/order`, `/v2/orders/batch`, `/v2/orders/replace`, `/v2/order/replace`, `/v2/order/replace-batch`, `DELETE /v2/order/cancel`, `/v2/order/cancel-all`, and `GET /v2/order`, `/v2/openOrders`, `/v2/history/order`, `/v2/history/fill`, `/v2/account`, `/v2/symbols`, `/v2/balances`, `/v2/positions`, `/v2/closedPositions`, `/v2/history/funding` (plus a few public market routes). Strategy, leverage, marginMode, `PUT /v2/symbols`, isoMargin and TWAP return `403 route is not available on the direct endpoint`. Unprovisioned wallets get `403 direct market access denied`; exceeding the profile quota gives `429 direct market access denied`.
+- Direct Market Access (`direct-eu.strikefinance.org`) is provisioned by Strike per API wallet (IP allowlist + scopes). It serves only: `POST /v2/order`, `/v2/orders/batch`, `/v2/orders/replace`, `/v2/order/replace`, `/v2/order/replace-batch`, `POST`/`DELETE /v2/_guards`, `DELETE /v2/order/cancel`, `/v2/order/cancel-all`, and `GET /v2/order`, `/v2/openOrders`, `/v2/history/order`, `/v2/history/fill`, `/v2/account`, `/v2/symbols`, `/v2/balances`, `/v2/positions`, `/v2/closedPositions`, `/v2/history/funding`, plus public `GET /v2/time`, `/v2/_status`, `/v2/markets[/:symbol]`, `/v2/l3/snapshot`, `/ws/l3`. Strategy, leverage, marginMode, `PUT /v2/symbols`, isoMargin and TWAP return `403 route is not available on the direct endpoint`. Unprovisioned wallets get `403 direct market access denied`; exceeding the profile quota gives `429 direct market access denied`.
 - Related skills: `strike-grid-bot` (grid bots), `strike-copy-trading` (copy trading), `strike-rfq` (request-for-quote), `strike-vaults` (vault management; the `vault_id` selector above is how a vault leader trades).

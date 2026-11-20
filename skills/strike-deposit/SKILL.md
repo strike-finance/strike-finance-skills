@@ -13,7 +13,7 @@ Deposits are three authenticated calls around one user-signed on-chain transacti
 
 The API wallet never moves funds itself: the user's own wallet signs the deposit transaction.
 
-**Access:** trading routes (API wallet or JWT, see strike-auth); all three reject sub-account-bound API wallets (`403 {"error":"not available to sub-account API keys"}`) — deposit to the master and fund sub-accounts in the Strike app. They return `503 {"error":"service unavailable"}` while the API is starting.
+**Access:** trading routes (API wallet or JWT, see strike-auth); all three reject sub-account-bound API wallets (`403 {"error":"not available to sub-account API keys"}`) — deposit to the master, then move funds with `POST /v2/sub-accounts/transfer` from a master API wallet (see strike-account). They return `503 {"error":"service unavailable"}` while the API is starting.
 
 **Chains:** `ethereum`, `solana`, `cardano`. The depositing wallet (`user_address`) must be one of the account's wallets on that chain. Supported assets are per-deployment configuration; e.g. `USDC` on Ethereum and Solana, `SOL` on Solana, and `ADA`, `USDM`, `USDCx`, `iUSD` on Cardano. Unsupported → `400 {"error":"unsupported asset"}`. Asset symbols are case-sensitive on Ethereum and Solana.
 
@@ -35,8 +35,8 @@ POST /v2/deposit/quote
 |-------|------|----------|-------------|
 | `blockchain` | string | Yes | `ethereum` \| `solana` \| `cardano` |
 | `asset_symbol` | string | Yes | Asset to deposit |
-| `asset_amount` | string | Yes | Amount in the asset's smallest unit (USDC 6 decimals: `"25000000"` = 25 USDC; SOL: lamports; ADA: lovelace) |
-| `mode` | string | No | `balance` (default) or `collateral` (credit collateral custody assets, `asset_amount` must be an integer string; `AAVE_V3_aUSDC` always uses this mode) |
+| `asset_amount` | string | Yes | Integer amount in the asset's smallest unit (USDC 6 decimals: `"25000000"` = 25 USDC; SOL: lamports; ADA: lovelace) |
+| `mode` | string | No | `balance` (default) or `collateral` (credit collateral custody assets, credited to Credit custody at `usd_value` `"0"`; the asset must be a configured custody asset on that chain, else `400 unsupported asset`; `AAVE_V3_aUSDC` always uses this mode). Any other value → `400 unsupported quote mode` |
 
 Minimum: `min_deposit_usd` from `GET /v2/portfolio` (default 1). Stablecoins are checked by token amount, other assets by USD value. Below it → `400 {"error":"amount below minimum"}`.
 
@@ -66,7 +66,7 @@ Minimum: `min_deposit_usd` from `GET /v2/portfolio` (default 1). Stablecoins are
 | Field | Type | Description |
 |-------|------|-------------|
 | `request_id` | string | Use in the next two calls |
-| `quote.usd_value` | string | USD that will be credited (`"0"` for collateral mode) |
+| `quote.usd_value` | string | USD that will be credited (`"0"` for collateral mode; an estimate for Cardano `ADA` balance deposits, see below) |
 | `quote.exchange_rate` | string | Asset → USD rate used |
 | `quote.confirmations` | number | Same as `confirmations_required` |
 | `quote.timestamp`, `quote.expiration_at` | number | Unix ms; build-tx and confirm must happen before `expiration_at` (default TTL 10 min) |
@@ -135,7 +135,11 @@ A base64 serialized legacy transaction with the user as fee payer. `expires_at` 
 }
 ```
 
-Unsigned transaction CBOR hex. `expires_at` is Unix **milliseconds** (tx validity, ~30 min). Sign with CIP-30 `signTx(unsigned_tx, true)`, add the returned witness set to the transaction (e.g. with Lucid or cardano-serialization-lib), then `submitTx`. For ADA deposits the transaction pays an exchanger address that Strike creates during build-tx; nothing else is needed from the client.
+Unsigned transaction CBOR hex in canonical form (CIP-21), so hardware wallets such as Ledger can sign it; keep the body bytes unchanged when you add the witness set. `expires_at` is Unix **milliseconds** (tx validity, ~30 min). Sign with CIP-30 `signTx(unsigned_tx, true)`, add the returned witness set to the transaction (e.g. with Lucid or cardano-serialization-lib), then `submitTx`.
+
+The transaction sends **2 ADA on top of the deposit amount** (the min-ADA a token output carries, or what the exchanger keeps on an ADA deposit); only `ADA` in collateral mode adds none. The wallet's `utxos` must cover the amount plus that 2 ADA plus the network fee.
+
+`ADA` balance deposits pay a one-off exchanger address created by build-tx: Strike swaps the ADA to USDM and deposits that, so the credited USD comes from the swap result, not exactly `quote.usd_value`. The exchanger watches for the funds until the tx validity ends; nothing else is needed from the client.
 
 **Errors:** `404 deposit quote not found or expired`, `400 deposit quote has expired`, `403 access denied` (quote belongs to another account, or `user_address` is not one of the account's wallets on that chain), `500 failed to build transaction` (e.g. missing `utxos` on Cardano, gas estimation failure).
 
@@ -167,14 +171,18 @@ Both fields required; `tx_hash` must be at least 10 characters (Ethereum tx hash
 }
 ```
 
-The balance is credited once the chain listener sees `confirmations_required` confirmations. Track it with `GET /v2/history/transaction` (strike-history) or the user stream.
+The balance is credited once the chain listener sees `confirmations_required` confirmations. Always confirm before `expiration_at`: a deposit that reaches its confirmations after the quote expired is credited only if this call recorded its exact tx hash. Track it with `GET /v2/history/transaction` (strike-history) or the user stream.
 
-**Errors:** `404 deposit quote not found or expired`, `403 access denied`, `400 deposit quote has expired`, `409 {"error":"deposit already submitted","tx_hash":"<first hash>"}` (only the first confirm is recorded).
+**Errors:** `400 invalid tx_hash format`, `404 deposit quote not found or expired`, `403 access denied`, `400 deposit quote has expired`, `409 {"error":"deposit already submitted","tx_hash":"<first hash>"}` (only the first confirm is recorded).
+
+### Crediting rules
+
+- **One credit per `request_id`.** A second transaction under the same quote is never credited: get a new quote for every deposit.
+- **Send the build-tx transaction as built.** A deposit is credited only in its quote's asset: an Ethereum vault deposit in any other token is ignored, and a Cardano deposit output may hold only ADA plus the quoted asset.
 
 ## Not for API Wallets
 
-- `GET /v2/deposit/cardano/address` (permanent per-account Cardano deposit address) is JWT-only.
-- `POST /v2/deposit/exchanger` needs a `bot_seed` the API never returns to clients; ADA exchanger jobs are already scheduled by build-tx.
+- `GET /v2/deposit/cardano/address` and `GET /v2/deposit/ethereum/address` (permanent per-account managed deposit addresses) are JWT-only.
 
 ## TypeScript Example
 

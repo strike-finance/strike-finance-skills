@@ -12,7 +12,7 @@ description: Strike Finance withdrawal flow with an API wallet — estimate, quo
 
 An API wallet alone can never withdraw: every API-wallet quote must be confirmed with a signature from the account's wallet. Passkey / authenticator-app (TOTP) authorization only applies to Strike-app email sessions; quotes they create cannot be confirmed with an API wallet (`403 {"error":"this withdrawal requires passkey authorization"}`).
 
-**Access:** trading routes (API wallet or JWT, see strike-auth); quote, estimate and confirm reject sub-account-bound API wallets (`403 {"error":"not available to sub-account API keys"}`) and return `503 {"error":"service unavailable"}` while the API is starting.
+**Access:** API wallet or JWT (see strike-auth); quote, estimate and confirm reject sub-account-bound API wallets (`403 {"error":"not available to sub-account API keys"}`), limits and queue position do not. All five return `503 {"error":"service unavailable"}` while the API is starting.
 
 ## Destination, Route and Fee
 
@@ -26,6 +26,8 @@ With an API wallet, `blockchain` is both the destination chain and the chain of 
 | `solana` | `USDC` | `direct_solana_usdc` | Solana vault |
 | `ethereum` | anything else (e.g. `ETH`, `USDT`, `WBTC`) | `relay_from_ethereum_usdc` | Ethereum USDC swapped via Relay |
 | `solana` | anything else (e.g. `SOL`, `USDT`) | `relay_from_solana_usdc` | Solana USDC swapped via Relay |
+
+**Liquidity fallback:** when the routed vault lacks the USDC to pay out, the quote (and the estimate) is built on the other USDC vault and Relay delivers the same destination asset: Ethereum destinations switch to `relay_from_solana_usdc`, Solana destinations to `relay_from_ethereum_usdc`. So `direct_*_usdc` can come back as a Relay route; read `route` / `source_*` from the response. Only an insufficient vault balance triggers it (not rate limits); Cardano has no fallback. When both vaults are short the quote fails with `503` `insufficient_protocol_liquidity`.
 
 - Fee: **$1** per withdrawal (`$0` with `source: "staking_reward"`), deducted from `usd_value` before conversion. Relay routes additionally carry Relay's swap/network cost in the received amount (`estimated_receive`, `minimum_receive`).
 - Minimum: `usd_value` rounded to whole dollars must be `>= min_withdraw_usd` (`GET /v2/portfolio`, default 5).
@@ -94,9 +96,9 @@ POST /v2/withdraw/quote
 | `asset` | string | Yes (balance mode) | Destination asset (see route table) |
 | `source` | string | No | `balance` (default) \| `staking_reward` (staking-reward bucket, balance mode only, no fee) |
 | `wallet_address` | string | No | Which of the account's wallets on `blockchain` signs (required if it has more than one there) |
-| `recipient_address` | string | No | Pay to this address instead of the account wallet. It is validated for the chain (Cardano: same network) and shown in the signed message |
+| `recipient_address` | string | No | Balance mode: pay to this address instead of the account wallet; shown in the signed message. Direct routes validate it (Cardano: base or enterprise address on the vault's network with a key, not script, payment credential; Ethereum: not the zero address, valid EIP-55 checksum if mixed-case), else `400` `recipient_invalid`. Relay routes hand it to Relay |
 | `mode` | string | No | `balance` (default) \| `collateral` |
-| `asset_symbol`, `asset_amount` | string | Collateral mode | Raw credit-collateral asset and integer smallest-unit amount (Cardano collateral withdrawals also need `wallet_address`) |
+| `asset_symbol`, `asset_amount` | string | Collateral mode | Raw credit-collateral asset and integer smallest-unit amount. Paid to the signing wallet (`recipient_address` is ignored), no fee. Cardano collateral withdrawals also need `wallet_address`, else `403` `cardano_requires_cardano_wallet` |
 
 **Response:**
 
@@ -121,7 +123,7 @@ POST /v2/withdraw/quote
 | `tx_cbor` | string | Cardano only: unsigned funding tx the wallet must sign (see below) |
 | `validator_address` | string | Cardano only: validator chosen for the funding tx |
 | `route`, `source_blockchain`, `source_asset`, `source_amount`, `destination_asset` | string | Route details; `source_amount` in source base units |
-| `estimated_receive`, `minimum_receive` | string | Relay routes: destination amount in base units |
+| `estimated_receive`, `minimum_receive` | string | Relay routes: destination amount in base units. Collateral mode: `estimated_receive` is the raw asset amount paid out |
 | `auth_mode` | string | Only for Strike-app email sessions |
 
 The quote has no expiry field: it is valid for the quote TTL (default **15 min**) from the timestamp in the message, and the signature must arrive within that window.
@@ -150,7 +152,7 @@ Recipient: {recipient address}
 
 When the signing wallet is on **Cardano**, `message_to_sign` is already the **hex encoding** of that text.
 
-**Quote errors** carry `code` when raised by quote generation: `amount_invalid`, `below_minimum` (+ `minimum_usd`), `unsupported_blockchain`, `unsupported_asset`, `recipient_invalid`, `insufficient_balance`, `insufficient_protocol_liquidity`, `rate_limited`, `route_unavailable`, `account_not_found`, `access_denied`, `source_invalid`, `insufficient_wallet_funds`, `internal_error`. Before that, the handler returns plain `400 invalid amount`, `400 invalid withdrawal source`, `400 withdrawal amount exceeds available balance`, `400 withdrawal amount exceeds staking reward balance`.
+**Quote errors** carry `code` when raised by quote generation: `amount_invalid`, `below_minimum` (+ `minimum_usd`), `unsupported_blockchain`, `unsupported_asset`, `recipient_invalid`, `insufficient_balance`, `insufficient_protocol_liquidity`, `rate_limited`, `route_unavailable`, `account_not_found`, `access_denied`, `source_invalid`, `insufficient_wallet_funds`, `cardano_requires_cardano_wallet`, `internal_error`. Before that, the handler returns plain `400 unsupported quote mode`, `400 invalid amount`, `400 invalid withdrawal source`, `400 withdrawal amount exceeds available balance`, `400 withdrawal amount exceeds staking reward balance`.
 
 ## Step 3: Sign with the User's Wallet
 
@@ -160,7 +162,7 @@ When the signing wallet is on **Cardano**, `message_to_sign` is already the **he
 | Solana | `signMessage(utf8Bytes(message_to_sign))` | Base58 signature |
 | Cardano | CIP-30 `signData(walletAddress, message_to_sign)` — pass the hex as-is, do **not** hex-encode again; `walletAddress` must be the exact address on the `Wallet:` line | `JSON.stringify({ signature, key })` or `"{signatureHex}:{keyHex}"` |
 
-**Cardano funding tx:** when the quote has `tx_cbor`, the user's Cardano wallet also pays about 2 ADA plus network fee toward the payout. Sign `tx_cbor` with CIP-30 `signTx`, add the witness set to the transaction, and send the **full signed transaction CBOR hex** as `signed_tx_cbor` (do not submit it yourself; Strike submits it on confirm). Without enough ADA the quote fails with `400` `insufficient_wallet_funds`.
+**Cardano funding tx:** when the quote has `tx_cbor`, the user's Cardano wallet also pays about 2 ADA plus network fee toward the payout. `tx_cbor` is canonical CBOR (CIP-21), so Ledger can sign it; keep the body bytes unchanged. Sign it with CIP-30 `signTx`, add the witness set to the transaction, and send the **full signed transaction CBOR hex** as `signed_tx_cbor` (do not submit it yourself; Strike submits it on confirm). Without enough ADA the quote fails with `400` `insufficient_wallet_funds`.
 
 ## Step 4: Confirm Withdrawal
 

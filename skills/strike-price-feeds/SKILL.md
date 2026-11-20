@@ -1,6 +1,6 @@
 ---
 name: strike-price-feeds
-description: Strike Finance public price WebSocket (wss://<host>/ws/price) — connection, subscribe formats, every stream (depth, bookticker, trade, markprice, markprice@1s, indexprice, miniticker, kline incl. mark/index), payloads, cadence, keepalive and limits. Use when building real-time trading interfaces, bots or price monitors.
+description: Strike Finance public price WebSocket (wss://<host>/ws/price) — connection, subscribe formats, every stream (full-depth diffs, bookticker, trade with seq, markprice, markprice@1s, indexprice, miniticker, kline incl. mark/index), payloads, cadence, keepalive, slow-client handling and limits. Use when building real-time trading interfaces, bots or price monitors.
 ---
 
 # Strike Finance Real-time Price Feeds
@@ -59,7 +59,10 @@ Errors: `{"e": "error", "E": 1792438737716, "error": {"code": 400, "msg": "Unkno
 
 - Client messages are limited to **4 KiB**; a larger frame closes the connection (split long `params` lists).
 - No per-connection subscription cap in the service.
-- Each client has a 1024-message outbound queue. If you fall behind, queued streams **drop messages for your connection** (it stays open) — for `depth` this silently corrupts a local book, so keep up and re-snapshot after reconnects. `!miniticker@arr` instead **disconnects** a client that cannot keep up. `@markprice@1s` and `@bookticker` keep only the newest message per stream (older pending ones are replaced).
+- Each client has a 1024-message outbound queue. What happens when it is full depends on the stream (Delivery column below):
+  - **disconnect** (`@depth`, `@trade`, `!miniticker@arr`): the server drops the socket (no close frame, so clients see `1006`) rather than leave a hole in a change-only stream. Reconnect, then re-snapshot depth / refill trades by `seq` / take the fresh `!miniticker@arr` snapshot.
+  - **newest only** (`@markprice@1s`, `@bookticker`): older pending messages are replaced by the newest; never disconnects.
+  - **queued** (everything else): messages for your connection are dropped while it stays open.
 - permessage-deflate is used when the client offers it (frames >= 256 bytes are compressed).
 
 ## Streams
@@ -68,39 +71,39 @@ Errors: `{"e": "error", "E": 1792438737716, "error": {"code": 400, "msg": "Unkno
 
 | Stream | Event `e` | Cadence | Delivery |
 |--------|-----------|---------|----------|
-| `<s>@depth` | `depthUpdate` | Diffs of the top 20 levels, flushed every 100 ms, only when something changed | queued |
+| `<s>@depth` | `depthUpdate` | Diffs of the whole book, chained by `pu`, flushed every 100 ms, only when something changed | disconnect |
 | `<s>@bookticker` | `bookTicker` | On each new order-book update (same 100 ms flush; values may repeat) | newest only |
-| `<s>@trade` | `trade` | Every public trade | queued |
+| `<s>@trade` | `trade` | Every public trade, numbered per market by `seq` | disconnect |
 | `<s>@markprice` | `markPriceUpdate` | Every 3 s | queued |
 | `<s>@markprice@1s` | `markPriceUpdate` | Every committed price-engine tick (nominally 1 s); `E` is the engine tick time | newest only |
 | `!markprice@arr` | array of `markPriceUpdate` | Every 3 s, all symbols | queued |
 | `<s>@indexprice` | `indexPriceUpdate` | Every 3 s (deprecated: use `i` from `@markprice@1s`) | queued |
 | `!indexprice@arr` | array of `indexPriceUpdate` | Every 3 s (deprecated) | queued |
 | `<s>@miniticker` | `24hrMiniTicker` | Every 1 s, for markets with 24h candle data (an idle market may send nothing) | queued |
-| `!miniticker@arr` | array of `24hrMiniTicker` | Full array right after subscribing, then every 1 s **only the markets whose values changed**. Snapshot entries are never removed: a market that stopped reporting keeps its last values (old `E`) | disconnect if slow |
-| `<s>@kline_<i>` | `kline` | Last-price candle: on every trade, at close (`x: true`), and a flat candle when a new period opens | queued |
+| `!miniticker@arr` | array of `24hrMiniTicker` | Full array right after subscribing, then every 1 s **only the markets whose values changed**. Snapshot entries are never removed: a market that stopped reporting keeps its last values (old `E`) | disconnect |
+| `<s>@kline_<i>` | `kline` | Last-price candle: on every trade (ADL excluded), at close (`x: true`), and a flat candle when a new period opens | queued |
 | `<s>@kline_<i>_mark` | `kline` | Mark-price candle on every mark tick | queued |
 | `<s>@kline_<i>_index` | `kline` | Index-price candle on every index tick | queued |
 
-**Payloads do not carry the stream name.** `<s>@kline_<i>`, `<s>@kline_<i>_mark` and `<s>@kline_<i>_index` produce identical shapes, as do `<s>@markprice` and `<s>@markprice@1s`. If you need more than one of these for the same symbol (and interval), use separate sockets — on one socket they cannot be told apart.
+**Kline payloads do not carry the stream name.** `<s>@kline_<i>`, `<s>@kline_<i>_mark` and `<s>@kline_<i>_index` produce identical shapes; if you need more than one of them for the same symbol and interval, use separate sockets. `markPriceUpdate` does carry `stream` (`btc-usd@markprice`, `btc-usd@markprice@1s`, or `!markprice@arr` on array elements), so those can share a socket. Other events are identified by `e` and `s`.
 
 There is no separate funding stream (funding rate `r` and next funding time `T` are in `markPriceUpdate`), no full 24h `ticker` stream, and no depth level/speed variants. Only `!miniticker@arr` sends an initial snapshot on subscribe; for depth, fetch `GET /price/v2/depth` (see `strike-orderbook`).
 
 ## Payloads
 
 ```jsonc
-// <s>@depth — changed levels only; "0" = level left the top 20
-{"e":"depthUpdate","E":1792438776570,"s":"BTC-USD","U":93450700,"u":93450741,
+// <s>@depth — changed levels only; "0" = level removed from the book; pu = previous message's u
+{"e":"depthUpdate","E":1792438776570,"s":"BTC-USD","U":93450700,"u":93450741,"pu":93450690,
  "b":[["82.55","1.82"],["82.40","0"]],"a":[["82.67","39.31"]]}
 
 // <s>@bookticker — complete best bid/ask; "" when a side is empty
-{"e":"bookTicker","E":1792438776570,"s":"BTC-USD","u":93450741,"b":"82.55","B":"1.82","a":"82.67","A":"39.31"}
+{"e":"bookTicker","E":1792438776570,"T":1792438776512,"s":"BTC-USD","u":93450741,"b":"82.55","B":"1.82","a":"82.67","A":"39.31"}
 
-// <s>@trade — m = buyer is maker (sell-side aggressor)
-{"e":"trade","E":1792172831030,"s":"BTC-USD","t":18071,"p":"77117.60","q":"0.0099","T":1792172831028,"m":true}
+// <s>@trade — m = buyer is maker (sell-side aggressor); seq = per-market trade number
+{"e":"trade","E":1792172831030,"s":"BTC-USD","t":18071,"seq":812,"p":"77117.60","q":"0.0099","T":1792172831028,"m":true,"order_type":"fill"}
 
-// <s>@markprice, <s>@markprice@1s, elements of !markprice@arr
-{"e":"markPriceUpdate","E":1792438738334,"s":"BTC-USD","p":"81649.00853590","i":"81922.34641572","r":"0.0000125","T":1792440000000}
+// <s>@markprice, <s>@markprice@1s, elements of !markprice@arr (stream = "!markprice@arr")
+{"stream":"btc-usd@markprice@1s","e":"markPriceUpdate","E":1792438738334,"s":"BTC-USD","p":"81649.00853590","i":"81922.34641572","r":"0.0000125","T":1792440000000}
 
 // <s>@indexprice, elements of !indexprice@arr
 {"e":"indexPriceUpdate","E":1792438739344,"s":"BTC-USD","p":"81922.34641572"}
@@ -116,9 +119,13 @@ There is no separate funding stream (funding rate `r` and next funding time `T` 
 
 | Field | Meaning |
 |-------|---------|
-| `depthUpdate.U` / `u` | First / final order-book update ID coalesced into this message (uint64; same domain as REST `lastUpdateId`). Not contiguous across messages. |
-| `depthUpdate.b` / `a` | Changed `[price, qty]` levels; `null` (not `[]`) when that side did not change. The first message after a symbol gets its first subscriber is the full top 20 without `"0"` removals (see `strike-orderbook`) |
-| `markPriceUpdate.p` / `i` / `r` / `T` | Mark price / index price / current funding rate / next funding time (ms) |
+| `depthUpdate.U` / `u` | First / final order-book update ID coalesced into this message (uint64; REST `lastUpdateId` is the last message's `u`). `U` need not be `pu + 1`. |
+| `depthUpdate.pu` | `u` of the previous `depthUpdate` for the symbol; a mismatch with the last `u` you applied means a missed message (sync rules: `strike-orderbook`) |
+| `depthUpdate.b` / `a` | Changed `[price, qty]` levels with absolute sizes; `null` (not `[]`) when that side did not change |
+| `bookTicker.E` / `T` | Publication time / matching-engine book time (ms) |
+| `trade.t` / `seq` / `order_type` | Exchange-wide trade ID / per-market trade number (+1 per trade; gap = missed trade, refill via REST `fromSeq`) / `fill`, `liquidation` or `adl` (see `strike-trades`) |
+| `markPriceUpdate.stream` | Subscription that produced it: `<s>@markprice`, `<s>@markprice@1s` or `!markprice@arr` |
+| `markPriceUpdate.p` / `i` / `r` / `T` | Mark price / index price / live hourly funding-rate estimate / next funding time (end of the current UTC hour, ms) |
 | `24hrMiniTicker.c` `o` `h` `l` `v` `q` | Close (last), open, high, low, base volume, quote volume over 24h |
 | `kline.k.t` / `T` | Candle open / close time (ms, close inclusive) |
 | `kline.k.v` `q` `n` | Base volume, quote volume, trade count |
@@ -131,7 +138,7 @@ There is no separate funding stream (funding rate `r` and next funding time `T` 
 
 - **Exponential backoff:** `delay = min(30000, 1000 * 2^attempt)`
 - **Tab visibility:** when the tab becomes visible and the socket is not OPEN, reconnect immediately
-- **Resubscribe** every active stream on reconnect, and re-fetch REST snapshots for stateful views (depth)
+- **Resubscribe** every active stream on reconnect, re-fetch REST snapshots for stateful views (depth), and refill trades by `seq` (`fromSeq`)
 
 ## Reference Counting
 
@@ -142,9 +149,9 @@ Track subscriptions per stream. Only send unsubscribe when the count reaches 0, 
 ```typescript
 type Handler = (event: any) => void;
 
-// Streams whose payloads are indistinguishable on one socket.
-const ambiguityKey = (stream: string) =>
-  stream.replace(/@markprice@1s$/, "@markprice").replace(/@(kline_[0-9]+[mhdwM])_(mark|index)$/, "@$1");
+// Kline streams whose payloads are indistinguishable on one socket (last vs _mark vs _index).
+// markPriceUpdate carries `stream`, so @markprice and @markprice@1s can share a socket.
+const ambiguityKey = (stream: string) => stream.replace(/@(kline_[0-9]+[mhdwM])_(mark|index)$/, "@$1");
 
 class StrikePriceFeed {
   private ws: WebSocket | null = null;
@@ -212,10 +219,11 @@ class StrikePriceFeed {
 // Usage
 const feed = new StrikePriceFeed();
 feed.connect();
-feed.on("markPriceUpdate", (e) => console.log(e.s, "mark", e.p, "index", e.i, "funding", e.r));
-feed.on("trade", (e) => console.log(e.s, e.m ? "SELL" : "BUY", e.q, "@", e.p));
+feed.on("markPriceUpdate", (e) => console.log(e.stream, "mark", e.p, "index", e.i, "funding", e.r));
+feed.on("trade", (e) => console.log(e.s, e.seq, e.m ? "SELL" : "BUY", e.q, "@", e.p, e.order_type));
 feed.on("kline", (e) => console.log(e.s, e.k.i, e.k.c, e.k.x ? "(closed)" : ""));
 feed.subscribe("btc-usd@markprice@1s");
+feed.subscribe("btc-usd@markprice"); // same socket is fine: e.stream tells them apart
 feed.subscribe("btc-usd@trade");
 feed.subscribe("btc-usd@kline_1m");
 feed.subscribe("!miniticker@arr");

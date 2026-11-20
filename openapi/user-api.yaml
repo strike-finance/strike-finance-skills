@@ -2,7 +2,7 @@ openapi: 3.0.3
 info:
   title: Strike Perpetuals - User Data REST API
   description: |
-    Read-only endpoints for account state, balances, portfolio, open positions, and trading history.
+    Read-only endpoints for account state, balances, portfolio, open positions, trading history, and whole-history exports (orders, fills, funding). The export job starters are `POST` with no body; everything else is `GET`.
 
     All endpoints use flexible authentication:
 
@@ -12,7 +12,7 @@ info:
     Selector precedence: `account_id` > `vault_id` > `blockchain` + `blockchain_address` > `blockchain_address` > authenticated account (optionally narrowed with `sub_account_id`).
 
     Decimal values are JSON strings; timestamps are Unix milliseconds. Errors are `{"error": "<message>"}`.
-  version: 2.2.0
+  version: 2.3.0
   contact:
     name: Strike Finance
     url: https://www.strikefinance.org
@@ -28,12 +28,15 @@ tags:
   description: Open and closed position queries
 - name: History
   description: Order, fill, position, funding, and transaction history
+- name: Exports
+  description: Whole-history exports of one account (orders, fills, funding) as async jobs with a presigned gzipped JSONL download
 x-tagGroups:
 - name: User Data
   tags:
   - Account
   - Positions
   - History
+  - Exports
 security:
 - ApiWalletPublicKey: []
   ApiWalletSignature: []
@@ -105,7 +108,7 @@ components:
       name: sub_account_id
       in: query
       required: false
-      description: Authenticated callers only. Reads an active sub-account owned by the caller (otherwise 401 with the no-selector message). Ignored when a public selector is present.
+      description: Authenticated callers only. Reads an active sub-account owned by the caller (the caller's own account ID is also accepted; anything else returns 401 with the no-selector message). Ignored when a public selector is present.
       schema:
         type: string
     ScopeQuery:
@@ -113,7 +116,7 @@ components:
       in: query
       required: false
       description: |
-        `all` reads the master account plus its active sub-accounts (the caller's family, or the family of a public `account_id` / `blockchain_address`). Cannot be combined with `vault_id` or `sub_account_id`. Any other value returns 400. API wallets bound to a sub-account get 403 for a private `scope=all`.
+        `all` (case-insensitive) reads the master account plus its active sub-accounts (the caller's family, or the family of a public `account_id` / `blockchain_address`). Cannot be combined with `vault_id` or `sub_account_id`. Any other value returns 400. API wallets bound to a sub-account get 403 for a private `scope=all`.
       schema:
         type: string
         enum:
@@ -123,12 +126,9 @@ components:
       in: query
       required: false
       description: |
-        `true` adds copy-trading executions (client_order_id prefix `copy:`) from the caller's other family accounts to the selected account's rows. Authenticated only; cannot be combined with `scope`, `account_id`, `blockchain_address`, or `vault_id` (accepts `sub_account_id`). Forbidden for API wallets bound to a sub-account.
+        Boolean (`true`/`false`, `1`/`0`; other values return 400). `true` adds copy-trading executions (client_order_id prefix `copy:`) from the caller's other family accounts to the selected account's rows. Authenticated only (401 otherwise); cannot be combined with `scope`, `account_id`, `blockchain_address`, or `vault_id` (accepts `sub_account_id`). Forbidden (403) for API wallets bound to a sub-account. `false` or omitted is a normal read.
       schema:
-        type: string
-        enum:
-        - 'true'
-        - 'false'
+        type: boolean
     SymbolQuery:
       name: symbol
       in: query
@@ -170,6 +170,14 @@ components:
       description: Opaque keyset cursor; pass `next_cursor` from the previous page.
       schema:
         type: string
+    ExportJobIdPath:
+      name: jobId
+      in: path
+      required: true
+      description: '`job_id` returned when the export was started'
+      schema:
+        type: string
+        example: 1a2b3c4d
   schemas:
     Error:
       type: object
@@ -292,6 +300,8 @@ components:
           - isolated
         default_leverage:
           type: integer
+          nullable: true
+          description: The account's saved default leverage; null when none is saved (each market then opens at its own default)
           example: 10
         symbol_settings:
           type: object
@@ -320,11 +330,23 @@ components:
           description: '`scope=all` only (balances are summed across these accounts)'
           items:
             $ref: '#/components/schemas/AggregateAccountRef'
+        positions:
+          type: array
+          description: |
+            `include_positions=true` only (omitted otherwise; `[]` when flat). Open positions from the same account read as the balances, same rows as GET /v2/positions, sorted by update_timestamp descending then symbol. With `scope=all`, rows of every family account (never netted), each with its `account_id`.
+          items:
+            $ref: '#/components/schemas/Position'
+        snapshot_timestamp:
+          type: integer
+          format: int64
+          description: |
+            `include_snapshot_timestamp=true` only. Unix ms time of the Redis read that loaded balance, positions, settings and order summaries in one transaction. Dates the persisted engine state (not cached mark prices or copy holds) and is not an engine sequence watermark. With `scope=all`, the earliest member read time (members are read independently); omitted when no member has engine state.
     BalanceResponse:
       type: object
       properties:
         asset:
           type: string
+          description: Always `USDT` here (the userstream labels the same balance `USD`)
           example: USDT
         walletBalance:
           type: string
@@ -603,6 +625,7 @@ components:
           example: 3232
         account_id:
           type: string
+          description: Owning account (always set; rows of different accounts are never netted)
         margin_mode:
           type: string
           enum:
@@ -632,6 +655,7 @@ components:
         update_timestamp:
           type: integer
           format: int64
+          description: Stored position update time (Unix ms). Advances on fills, non-zero funding, margin and leverage changes; equals the userstream position update `T` for the same state. Values can tie.
         symbol:
           type: string
           example: BTC-USD
@@ -760,13 +784,22 @@ components:
           type: string
           nullable: true
           description: null or "" for user orders; otherwise liquidation, adl, bankrupt, if_transfer, vault_withdrawal, slp_transfer
+        stp_mode:
+          type: string
+          description: Self-trade prevention mode (`expire_maker` when none was stored)
+          enum:
+          - expire_maker
+          - expire_taker
+          - expire_both
         time_in_force:
           type: string
           nullable: true
+          description: '`ALO` = add-liquidity-only (post-only). `FOK` appears only on orders placed before FOK was removed.'
           enum:
           - GTC
-          - FOK
           - IOC
+          - ALO
+          - FOK
         working_type:
           type: string
           nullable: true
@@ -784,6 +817,7 @@ components:
           type: string
         post_only:
           type: boolean
+          description: true exactly when time_in_force is `ALO`. Most post-only orders placed before the ALO cutover (November 2026) read `GTC` / false.
         reduce_only:
           type: boolean
         close_position:
@@ -1257,6 +1291,123 @@ components:
           description: '`scope=all` only'
           items:
             $ref: '#/components/schemas/AggregateAccountRef'
+    ExportJobCreatedResponse:
+      type: object
+      properties:
+        job_id:
+          type: string
+          example: 1a2b3c4d
+    ExportJobStatusResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          enum:
+          - queued
+          - processing
+          - complete
+          - failed
+        download_url:
+          type: string
+          description: complete only. Presigned link to one gzipped JSON Lines file (possibly several concatenated gzip members); no auth headers needed.
+        count:
+          type: integer
+          format: int64
+          description: complete only. Rows in the file.
+        order_count:
+          type: integer
+          format: int64
+          description: Order exports only (complete); same value as count
+        expires_at:
+          type: string
+          format: date-time
+          description: complete only. When download_url stops working (24 h after completion by default).
+        error:
+          type: string
+          description: failed only
+          example: export failed, please try again later
+      required:
+      - status
+    OrderExportRow:
+      type: object
+      description: |
+        One line of an order export. Same keys as OrderHistoryResult except: null values are omitted rather than `null`; no `error_message`; extra `cost`, `fee`, `created_at`, `updated_at`. Live rows carry `stp_mode` and no `post_only`; archived rows written before the ALO cutover carry `post_only` and no `stp_mode`.
+      properties:
+        id:
+          type: integer
+          format: int64
+        client_order_id:
+          type: string
+        account_id:
+          type: string
+        symbol:
+          type: string
+        strategy_id:
+          type: string
+        is_primary:
+          type: boolean
+        close_reason:
+          type: string
+        side:
+          type: string
+        status:
+          type: string
+        type:
+          type: string
+        origin_type:
+          type: string
+        auto_close_type:
+          type: string
+        time_in_force:
+          type: string
+        stp_mode:
+          type: string
+        post_only:
+          type: boolean
+          description: Archived pre-ALO rows only
+        working_type:
+          type: string
+        size:
+          type: string
+        filled:
+          type: string
+        price:
+          type: string
+        stop_price:
+          type: string
+        cost:
+          type: string
+        fee:
+          type: string
+        reduce_only:
+          type: boolean
+        close_position:
+          type: boolean
+        price_protect:
+          type: boolean
+        callback_rate:
+          type: string
+        activation_price:
+          type: string
+        trailing_extreme:
+          type: string
+        trailing_activated:
+          type: boolean
+        create_timestamp:
+          type: integer
+          format: int64
+        entry_timestamp:
+          type: integer
+          format: int64
+        event_timestamp:
+          type: integer
+          format: int64
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
   responses:
     BadRequest:
       description: Invalid parameter
@@ -1297,11 +1448,61 @@ components:
               value:
                 error: request already processed
     Forbidden:
-      description: Selector not allowed for this caller
+      description: Selector not allowed for this caller, or API wallet request from an IP outside the wallet's allowlist
       content:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
+          examples:
+            sub_account_wallet_scope_all:
+              value:
+                error: scope=all is not available to sub-account API keys
+            ip_not_allowed:
+              value:
+                error: request IP is not allowed for this API key
+                client_ip: 203.0.113.7
+    ExportSingleAccount:
+      description: Invalid export request (`scope` or `include_copies` present, or an invalid account selector)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          examples:
+            single_account:
+              value:
+                error: an export covers one account; scope=all and include_copies are not supported
+    ExportNotConfigured:
+      description: History exports are not configured on this deployment
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: history export is not configured
+    ExportAlreadyRunning:
+      description: An export of this kind is already queued or running for this account
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: an export is already in progress for this account
+    ExportRequesterBusy:
+      description: The requester (authenticated account, else client IP) already has an export queued or running
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: you already have an export queued or running; wait for it to finish
+    ExportNotFound:
+      description: Unknown or expired job, or a job started for a different account than the selector names
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: export job not found or expired
     NotFound:
       description: Account not found
       content:
@@ -1325,6 +1526,8 @@ paths:
         Account balances, margin totals, default and per-symbol settings, and sub-accounts.
 
         `vault_id` queries additionally return `inventory_costs_usd`, `custody_balances`, `conversion_reserved_usd`, `slp_adl` and blank the wallet fields. `scope=all` sums balances across the family and adds `accounts`.
+
+        `include_positions=true` adds `positions` (same rows as GET /v2/positions) from the same account read as the balances; `include_snapshot_timestamp=true` adds `snapshot_timestamp`, the Unix ms time of that read.
       parameters:
       - $ref: '#/components/parameters/AccountIdQuery'
       - $ref: '#/components/parameters/VaultIdQuery'
@@ -1332,6 +1535,20 @@ paths:
       - $ref: '#/components/parameters/BlockchainAddressQuery'
       - $ref: '#/components/parameters/SubAccountIdQuery'
       - $ref: '#/components/parameters/ScopeQuery'
+      - name: include_positions
+        in: query
+        required: false
+        description: Boolean (`true`/`false`, `1`/`0`; other values return 400 `include_positions must be a boolean (true/false or 1/0)`). Adds `positions`.
+        schema:
+          type: boolean
+          default: false
+      - name: include_snapshot_timestamp
+        in: query
+        required: false
+        description: Boolean (`true`/`false`, `1`/`0`; other values return 400 `include_snapshot_timestamp must be a boolean (true/false or 1/0)`). Adds `snapshot_timestamp`.
+        schema:
+          type: boolean
+          default: false
       responses:
         '200':
           description: Account information
@@ -1355,12 +1572,29 @@ paths:
                 maintenance_margin: '500'
                 sub_accounts: []
                 default_margin_mode: cross
-                default_leverage: 10
+                default_leverage: null
                 symbol_settings:
                   BTC-USD:
                     margin_mode: cross
                     leverage: 20
                     allow_pre_trade: false
+                positions:
+                - id: 3232
+                  account_id: 01a144dc-27e4-706c-ac46-9c2c1e77d60b
+                  margin_mode: cross
+                  leverage: 20
+                  size: '-0.09397'
+                  entry_price: '81558.69091944'
+                  iso_balance: '0'
+                  accumulated_funding_fees: '270.2568393349164184'
+                  create_timestamp: 1791865713298
+                  update_timestamp: 1791865713298
+                  symbol: BTC-USD
+                  upnl: '-8.48714642'
+                  maintenance_margin: '30.69022933'
+                  bankruptcy_price: '157758.0419616276541'
+                  liquidation_price: '156750.9643582120454'
+                snapshot_timestamp: 1792440000123
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':
@@ -1763,7 +1997,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/FillHistoryResponse'
         '400':
-          description: Invalid parameter (e.g. `cannot use both fromId and since_trade_id`, `invalid aggregate parameter`)
+          description: Invalid parameter (e.g. `cannot use both fromId and since_trade_id`, `invalid aggregate parameter`, `invalid source parameter`)
           content:
             application/json:
               schema:
@@ -1942,7 +2176,7 @@ paths:
         in: query
         required: false
         description: |
-          Comma-separated or repeated. Integers `1` deposit, `2` withdraw, `3` fee, `4` realized_pnl, `5` liquidation, `6` funding, `7` reward_grant, `8` reward_reclaim, `9` credit, `10` transfer, `11` liquidation_income, or the names themselves.
+          Comma-separated or repeated. Integers `1` deposit, `2` withdraw, `3` fee, `4` realized_pnl, `5` liquidation, `6` funding, `7` reward_grant, `8` reward_reclaim, `9` credit, `10` transfer, `11` liquidation_income, or the names themselves. The name `pnl_adjustment` (no integer) selects operator PnL corrections: `realized_pnl` rows whose metadata has an `adjustment_reason`, without per-fill realized PnL rows. It combines with other types by OR.
         schema:
           type: string
         example: 1,2
@@ -1992,3 +2226,218 @@ paths:
           $ref: '#/components/responses/NotFound'
         '403':
           $ref: '#/components/responses/Forbidden'
+  /v2/orders/export:
+    post:
+      tags:
+      - Exports
+      summary: Start an order history export
+      description: |
+        Queues a job that writes the account's complete order history (including archived orders) to one gzipped JSON Lines file, one OrderExportRow per line: archived orders oldest day first, then live orders by id ascending. No request body (sign the empty body hash).
+
+        Selects the account like the history reads: `account_id`, `vault_id` or `blockchain_address` exports any account without auth; with no selector, the signer's own account (or `sub_account_id`). `scope` and `include_copies` are rejected. Poll GET /v2/orders/export/{jobId} with the same selector.
+
+        One export queued or running per requester (the authenticated account, else the client IP) and one per account per kind. A job that waits more than 30 minutes in the queue or runs more than 60 minutes fails.
+      parameters:
+      - $ref: '#/components/parameters/AccountIdQuery'
+      - $ref: '#/components/parameters/VaultIdQuery'
+      - $ref: '#/components/parameters/BlockchainQuery'
+      - $ref: '#/components/parameters/BlockchainAddressQuery'
+      - $ref: '#/components/parameters/SubAccountIdQuery'
+      responses:
+        '202':
+          description: Export queued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExportJobCreatedResponse'
+        '400':
+          $ref: '#/components/responses/ExportSingleAccount'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/ExportAlreadyRunning'
+        '429':
+          $ref: '#/components/responses/ExportRequesterBusy'
+        '503':
+          $ref: '#/components/responses/ExportNotConfigured'
+  /v2/orders/export/{jobId}:
+    get:
+      tags:
+      - Exports
+      summary: Get order export status
+      description: Status of an order export. Pass the same account selector used to start it. Status is kept for 24 hours.
+      parameters:
+      - $ref: '#/components/parameters/ExportJobIdPath'
+      - $ref: '#/components/parameters/AccountIdQuery'
+      - $ref: '#/components/parameters/VaultIdQuery'
+      - $ref: '#/components/parameters/BlockchainQuery'
+      - $ref: '#/components/parameters/BlockchainAddressQuery'
+      - $ref: '#/components/parameters/SubAccountIdQuery'
+      responses:
+        '200':
+          description: Export status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExportJobStatusResponse'
+              examples:
+                processing:
+                  value:
+                    status: processing
+                complete:
+                  value:
+                    status: complete
+                    download_url: https://example-bucket.s3.amazonaws.com/exports/...jsonl.gz?X-Amz-Signature=...
+                    count: 12345
+                    order_count: 12345
+                    expires_at: '2026-11-22T10:00:00Z'
+                failed:
+                  value:
+                    status: failed
+                    error: export failed, please try again later
+        '400':
+          $ref: '#/components/responses/ExportSingleAccount'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/ExportNotFound'
+        '503':
+          $ref: '#/components/responses/ExportNotConfigured'
+  /v2/fills/export:
+    post:
+      tags:
+      - Exports
+      summary: Start a fill history export
+      description: |
+        Queues a job that writes the account's complete fill history to one gzipped JSON Lines file, one FillHistoryResult per line (no aggregate fields), oldest first by (timestamp, id). A fill that paid two liquidation-fee transactions can appear twice; dedupe by `id`. No request body.
+
+        Account selection, limits and polling are as for POST /v2/orders/export; poll GET /v2/fills/export/{jobId}.
+      parameters:
+      - $ref: '#/components/parameters/AccountIdQuery'
+      - $ref: '#/components/parameters/VaultIdQuery'
+      - $ref: '#/components/parameters/BlockchainQuery'
+      - $ref: '#/components/parameters/BlockchainAddressQuery'
+      - $ref: '#/components/parameters/SubAccountIdQuery'
+      responses:
+        '202':
+          description: Export queued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExportJobCreatedResponse'
+        '400':
+          $ref: '#/components/responses/ExportSingleAccount'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/ExportAlreadyRunning'
+        '429':
+          $ref: '#/components/responses/ExportRequesterBusy'
+        '503':
+          $ref: '#/components/responses/ExportNotConfigured'
+  /v2/fills/export/{jobId}:
+    get:
+      tags:
+      - Exports
+      summary: Get fill export status
+      description: Status of a fill export (no `order_count`). Pass the same account selector used to start it. Status is kept for 24 hours.
+      parameters:
+      - $ref: '#/components/parameters/ExportJobIdPath'
+      - $ref: '#/components/parameters/AccountIdQuery'
+      - $ref: '#/components/parameters/VaultIdQuery'
+      - $ref: '#/components/parameters/BlockchainQuery'
+      - $ref: '#/components/parameters/BlockchainAddressQuery'
+      - $ref: '#/components/parameters/SubAccountIdQuery'
+      responses:
+        '200':
+          description: Export status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExportJobStatusResponse'
+        '400':
+          $ref: '#/components/responses/ExportSingleAccount'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/ExportNotFound'
+        '503':
+          $ref: '#/components/responses/ExportNotConfigured'
+  /v2/funding/export:
+    post:
+      tags:
+      - Exports
+      summary: Start a funding payment history export
+      description: |
+        Queues a job that writes the account's complete funding payment history to one gzipped JSON Lines file, one FundingHistoryResult per line, id descending. No request body.
+
+        Account selection, limits and polling are as for POST /v2/orders/export; poll GET /v2/funding/export/{jobId}.
+      parameters:
+      - $ref: '#/components/parameters/AccountIdQuery'
+      - $ref: '#/components/parameters/VaultIdQuery'
+      - $ref: '#/components/parameters/BlockchainQuery'
+      - $ref: '#/components/parameters/BlockchainAddressQuery'
+      - $ref: '#/components/parameters/SubAccountIdQuery'
+      responses:
+        '202':
+          description: Export queued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExportJobCreatedResponse'
+        '400':
+          $ref: '#/components/responses/ExportSingleAccount'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/ExportAlreadyRunning'
+        '429':
+          $ref: '#/components/responses/ExportRequesterBusy'
+        '503':
+          $ref: '#/components/responses/ExportNotConfigured'
+  /v2/funding/export/{jobId}:
+    get:
+      tags:
+      - Exports
+      summary: Get funding export status
+      description: Status of a funding export (no `order_count`). Pass the same account selector used to start it. Status is kept for 24 hours.
+      parameters:
+      - $ref: '#/components/parameters/ExportJobIdPath'
+      - $ref: '#/components/parameters/AccountIdQuery'
+      - $ref: '#/components/parameters/VaultIdQuery'
+      - $ref: '#/components/parameters/BlockchainQuery'
+      - $ref: '#/components/parameters/BlockchainAddressQuery'
+      - $ref: '#/components/parameters/SubAccountIdQuery'
+      responses:
+        '200':
+          description: Export status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExportJobStatusResponse'
+        '400':
+          $ref: '#/components/responses/ExportSingleAccount'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/ExportNotFound'
+        '503':
+          $ref: '#/components/responses/ExportNotConfigured'
