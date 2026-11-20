@@ -51,10 +51,11 @@ True taker-buy volume = `volume − row[9]` (quote: `quoteVolume − row[10]`).
 
 - **No `startTime`/`endTime`:** the newest `limit` candles, ending at the newest stored candle plus the in-progress candle if one exists. Not forward-filled to "now" (an idle market's last candle can be old).
 - **`endTime` set:** the newest `limit` candles with open time <= `endTime`, gap-filled forward to `endTime` (never into the in-progress period, which is included as observed when `endTime` reaches it). Anchored at `endTime` — if you also pass `startTime` and need a strict lower bound, drop rows with `openTime < startTime`.
-- **Only `startTime` set:** the first `limit` candles from `startTime` forward. If that window has no data, the server seeds it with the last candle **before** `startTime`, so a row with `openTime < startTime` can appear; drop it if you need a strict bound.
+- **Only `startTime` set:** the first `limit` candles from `startTime` forward. If that window has no data, the server seeds it with the last candle **before** `startTime`, so a row with `openTime < startTime` can appear; drop it if you need a strict bound. A `startTime` before the market's listing returns rows from its first candle (no flat candles before it).
 - Gaps **between** candles are filled with flat candles at the previous close and zero volume. Nothing is generated before the market's first candle.
 - For `last`, each closed candle's `open` is set to the previous candle's `close` (the WebSocket `k.o` is the period's first trade price, so REST and WS opens can differ for the same candle).
-- For `mark`/`index`, volume, trades and taker fields are copied from the matching `last` candles.
+- `last` candles exclude ADL trades (`order_type: "adl"` settles at a settlement price, not a market price), in price and volume, on REST and WS.
+- For `mark`/`index`, volume, trades and taker fields are copied from the matching `last` candles. Closed `mark`/`index` candles of `3m` and longer are rebuilt from that period's recorded `1m` candles (first minute's open, last minute's close, high/low across them), so a closed candle can differ slightly from the last WS update for it. On REST, the in-progress `mark`/`index` candle's `open` is set to the previous candle's close when the two are adjacent.
 - Responses that do not include the in-progress candle are cached about 5 s (`X-Cache`).
 
 Errors (`400`): `{"code":"MISSING_PARAMETER","msg":"symbol parameter is required"}` (or `interval ...`), `{"code":"INVALID_PARAMETER","msg":"invalid interval"}`, `"invalid startTime"`, `"invalid endTime"`, `"priceType must be 'last', 'mark', or 'index'"`.
@@ -108,7 +109,7 @@ const older = await fetchKlines("BTC-USD", "15m", { limit: 1500, endTime: bars[0
 
 | Stream | Series | Updates |
 |--------|--------|---------|
-| `<symbol>@kline_<interval>` | last price | On every trade; final update with `x: true` when the period closes; a flat candle at the previous close when a new period opens |
+| `<symbol>@kline_<interval>` | last price | On every trade (ADL excluded); final update with `x: true` when the period closes; a flat candle at the previous close when a new period opens |
 | `<symbol>@kline_<interval>_mark` | mark price | On every mark-price tick; `x: true` on close |
 | `<symbol>@kline_<interval>_index` | index price | On every index-price tick; `x: true` on close |
 

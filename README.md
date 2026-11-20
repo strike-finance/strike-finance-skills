@@ -26,19 +26,19 @@ npx strike-finance-skills install --agents claude cursor codex
 
 | Skill | Description |
 |-------|-------------|
-| `strike-auth` | Builder connect, Ed25519 API wallet request signing, builder fee header, auth errors |
-| `strike-account` | Account, balances, portfolio, sub-accounts, markets config, fee tiers, server time |
+| `strike-auth` | Builder connect, Ed25519 API wallet request signing, builder fee header, per-key IP allowlists, auth errors |
+| `strike-account` | Account (with positions + snapshot timestamp), balances, portfolio, sub-account management, markets config (asset class, tags), fee tiers, engine status, server time |
 | `strike-deposit` | Multi-chain deposit flow (quote, build-tx, confirm) |
 | `strike-withdraw` | Withdrawal flow (quote, estimate, sign, confirm), limits, queue position |
-| `strike-trading` | Orders, batch orders, bracket strategies, TWAP, leverage, margin |
-| `strike-market-data` | Public market data REST (depth, trades, funding, mark/index, tickers, stats, klines, OI, FX) |
-| `strike-orderbook` | Orderbook REST snapshots, top-20 WebSocket depth diffs, L3 market-by-order feed |
-| `strike-trades` | Public market trades (REST + real-time WebSocket) |
+| `strike-trading` | Orders, batch orders, bracket strategies, ALO (post-only), self-trade prevention, request guards, TWAP, leverage, margin |
+| `strike-market-data` | Public market data REST (depth, trades, funding, funding caps, mark/index, tickers, stats, klines, OI, FX) |
+| `strike-orderbook` | Orderbook REST snapshots, full-depth WebSocket diffs chained by `pu`, L3 market-by-order feed |
+| `strike-trades` | Public market trades (REST + real-time WebSocket), per-market `seq` with gap refill, liquidation/ADL flags |
 | `strike-klines` | Chart/candlestick data with mark/index price klines |
 | `strike-price-feeds` | Public price WebSocket: depth, trades, mark/index, tickers, klines |
-| `strike-userstream` | Authenticated WebSocket (`session.logon`) for orders, fills, balances, positions, strategies |
+| `strike-userstream` | Authenticated WebSocket (`session.logon`) with topic filters for orders, fills, balances, positions, strategies |
 | `strike-calculations` | Backend-matching formulas: liquidation price, PnL, margin tiers, balances, fees, funding |
-| `strike-history` | Positions, closed positions, position history, order/fill/funding/transaction history |
+| `strike-history` | Positions, closed positions, position history, order/fill/funding/transaction history, history exports |
 | `strike-grid-bot` | Grid trading bots: create, stop, list, orders, lifecycle, user-stream events |
 | `strike-copy-trading` | Copy trading: discover lead traders, subscribe/update/stop, reserved balance, profit share |
 | `strike-rfq` | Request-for-quote: requester and quoter flows, RFQ socket, status lifecycle |
@@ -57,9 +57,13 @@ npx strike-finance-skills install --agents claude cursor codex
 ## OpenAPI Specs
 
 Full OpenAPI 3.0 specs are included in `openapi/` for reference:
-- `trade-api.yaml` — Order management, leverage, margin, TWAP
-- `user-api.yaml` — Account, balances, portfolio, positions, history
+- `trade-api.yaml` — Order management, leverage, margin, TWAP, request guards, engine status
+- `user-api.yaml` — Account, balances, portfolio, positions, history, history exports
 - `market-api.yaml` — Public market data (served under `/price`)
+
+## Backend Sync
+
+Skills and specs are verified against `strike-v2-backend` `main` at the commit in [`.backend-sha`](.backend-sha). To re-sync, diff the backend from that commit to `main`, update the affected skills and specs, and bump the file.
 
 ## Manual Install
 

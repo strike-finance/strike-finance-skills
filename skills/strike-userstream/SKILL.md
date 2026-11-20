@@ -1,6 +1,6 @@
 ---
 name: strike-userstream
-description: Strike Finance user stream -- authenticated WebSocket for API wallets (session.logon), sub-account and vault subscriptions, ORDER_TRADE_UPDATE (orders and fills), ACCOUNT_UPDATE (balances, positions, transfer statuses, async leverage/margin/transfer outcomes, vault events), strategyUpdate (TWAP, grid bots), rfqUpdate and the RFQ quoter feed, errors, keepalive and resync rules. Critical for trading bots.
+description: Strike Finance user stream -- authenticated WebSocket for API wallets (session.logon), sub-account and vault subscriptions, topic filters (account, orders, fills, strategy), ORDER_TRADE_UPDATE (orders and fills, time in force, STP mode), ACCOUNT_UPDATE (balances, positions, transfer statuses, async leverage/margin/transfer outcomes, vault events), strategyUpdate (TWAP, grid bots), rfqUpdate and the RFQ quoter feed, errors, keepalive and resync rules. Critical for trading bots.
 ---
 
 # Strike Finance User Stream WebSocket
@@ -35,7 +35,7 @@ RECEIVE: {"id": 1, "status": 200, "result": {"authenticated": true, "account_id"
 
 - `id` is echoed as sent (number or string).
 - `account_id` is the wallet's bound account; for a wallet created on a sub-account it is the sub-account ID.
-- Every logon failure (bad signature, unknown/expired/revoked wallet, timestamp outside the window, DMA denial or DMA connection limit) returns the same `401 Authentication failed` error and leaves the socket open, so you can retry.
+- Every logon failure (bad signature, unknown/expired/revoked wallet, timestamp outside the window, source IP outside the wallet's IP allowlist, DMA denial or DMA connection limit) returns the same `401 Authentication failed` error and leaves the socket open, so you can retry. The IP allowlist is checked only at logon; an established session keeps running.
 - A socket is bound to one account for its lifetime. Logging on again as the same account succeeds and re-sends the `200` reply; a different account gets `403 Connection is already authenticated as a different account`.
 
 ## Subscribe
@@ -52,9 +52,33 @@ RECEIVE: {"result": null, "id": 2}
 | Vault | `{"method":"subscribe","channel":"userstream","vault_id":"<VAULT_ID>","id":4}` or `"account_id":"vault_..."` | none |
 
 - One socket can hold many subscriptions (master + sub-accounts + vaults), but **balance updates, transfer statuses and order-state updates do not identify the account** (only position updates, and fill updates with position context, carry `account_id`). Use one socket per account if you need attribution. Unsubscribe with `"method":"unsubscribe"` and the same fields.
-- Binance-style requests also work: `{"method":"SUBSCRIBE","params":["<ACCOUNT_ID>@userstream"],"id":5}` (`id` must be an integer; owned sub-account IDs are allowed here as well).
+- Binance-style requests also work: `{"method":"SUBSCRIBE","params":["<ACCOUNT_ID>@userstream"],"id":5}` (`id` must be an integer; owned sub-account IDs are allowed here as well). This form takes no `topics` and always receives every topic.
 - Only the `userstream` channel carries account data (plus `rfq` for allowlisted quoters, below). Other channel names are accepted but never receive anything.
-- No snapshot is sent on subscribe. Subscribe first, then load REST state (`/v2/openOrders`, `/v2/positions`, `/v2/balances`), then apply events.
+- No snapshot is sent on subscribe. Subscribe first, then load REST state (`/v2/openOrders`, `/v2/positions`, `/v2/balances`, or `/v2/account?include_positions=true`), then apply events.
+
+### Topics
+
+A `subscribe` may carry an optional `topics` list to receive only part of the stream:
+
+```json
+SEND:    {"method": "subscribe", "channel": "userstream", "topics": ["account", "fills"], "id": 6}
+```
+
+| Topic | Messages |
+|-------|----------|
+| `account` | `ACCOUNT_UPDATE`: balances, positions, transfer statuses, wrapped async/vault/credit events |
+| `orders` | `ORDER_TRADE_UPDATE` order-state updates (`t == 0`) |
+| `fills` | `ORDER_TRADE_UPDATE` fill updates (`t > 0`) |
+| `strategy` | `strategyUpdate` (TWAP terminal, grid bot) |
+
+- Omitting `topics` receives every topic. Names are case-insensitive. `rfqUpdate` is not topic-filtered (always delivered).
+- The filter belongs to that one subscription (account / sub-account / vault). Subscribing again to the same target replaces its list; subscribing again without `topics` removes the filter.
+- An empty list, a non-array value or an unknown name returns `400 Invalid topics: ...` and does not subscribe.
+- A market maker that tracks fills and balances but not its own quote churn can drop `orders`; a bot that tracks open orders needs both `orders` and `fills`.
+
+### Vault subscriptions (public)
+
+Vault streams are public, so every `vault_id` (or `vault_...` `account_id`) subscription is a public viewer, including the vault leader's own bot. Public viewers get the `orders` topic **batched, once per second by default**: each batch carries the latest `ORDER_TRADE_UPDATE` of every order that changed since the previous batch, in first-change order. A plain limit order placed and then canceled, rejected or expired without a fill inside one batch is not sent at all. Fills and every other topic are not batched. A vault leader needing every quote update should track orders from its own REST responses and `GET /v2/openOrders?vault_id=...` instead.
 
 ## Errors
 
@@ -66,7 +90,7 @@ Errors are not correlated by `id`:
 
 | code | msg |
 |------|-----|
-| 400 | `Invalid JSON format`, `Missing channel in subscribe request`, `Missing symbol or account_id in subscribe request` (subscribe sent before the logon reply, without `account_id`), `Unknown method: <m>`, `Invalid params format`, `Missing required parameters (apiKey, signature, timestamp)`, `Authentication not available on this endpoint`, `RFQ sockets cannot have ordinary subscriptions` |
+| 400 | `Invalid JSON format`, `Missing channel in subscribe request`, `Missing symbol or account_id in subscribe request` (subscribe sent before the logon reply, without `account_id`), `Invalid topics: topics must be an array of strings`, `Invalid topics: topics must not be empty; omit it to receive every topic`, `Invalid topics: unknown topic "<name>" (valid: account, orders, fills, strategy)`, `Unknown method: <m>`, `Invalid params format`, `Missing required parameters (apiKey, signature, timestamp)`, `Authentication not available on this endpoint`, `RFQ sockets cannot have ordinary subscriptions` |
 | 401 | `Authentication failed`, `Authentication required: use AUTH or session.logon before subscribing to user data streams`, `Authentication required: use AUTH or session.logon before subscribing to sub-account user data streams` |
 | 403 | `Unauthorized: cannot subscribe to another account's data`, `Unauthorized: cannot subscribe to another account's sub-account data`, `Connection is already authenticated as a different account` |
 | 404 | `Vault not found` |
@@ -78,16 +102,18 @@ Errors are not correlated by `id`:
 {"e": "<EVENT_TYPE>", "E": 1792440000123, "s": "BTC-USD", "data": { }}
 ```
 
-`E` is the server send time, except grid-bot `strategyUpdate` (`E` = bot event time) and `rfqUpdate` (`E` = the RFQ's `updated_at_ms`). `s` is present only on `strategyUpdate` and `rfqUpdate`.
+`E` is the time the stream server processed the event, except grid-bot `strategyUpdate` (`E` = bot event time) and `rfqUpdate` (`E` = the RFQ's `updated_at_ms`). `s` is present only on `strategyUpdate` and `rfqUpdate`.
 
-| `e` | Content |
-|-----|---------|
-| `ORDER_TRADE_UPDATE` | Order state changes and fills |
-| `ACCOUNT_UPDATE` | Balance changes, position changes, transfer statuses, wrapped async outcomes |
-| `strategyUpdate` | TWAP terminal events, grid bot events |
-| `rfqUpdate` | Status of RFQs you requested |
+| `e` | Topic | Content |
+|-----|-------|---------|
+| `ORDER_TRADE_UPDATE` | `orders` / `fills` | Order state changes and fills |
+| `ACCOUNT_UPDATE` | `account` | Balance changes, position changes, transfer statuses, wrapped async outcomes |
+| `strategyUpdate` | `strategy` | TWAP terminal events, grid bot events |
+| `rfqUpdate` | (unfiltered) | Status of RFQs you requested |
 
 Ordering: events for one account keep their order within the order/fill path and within the account/position/strategy path, but `ORDER_TRADE_UPDATE` and `ACCOUNT_UPDATE` can interleave in either order.
+
+Ignore `e` values you do not handle. For example, every socket logged on as an account also receives `{"e":"chartDrawings",...}` when the account's owner saves chart drawings in the Strike app, whatever it subscribed to.
 
 ## ORDER_TRADE_UPDATE
 
@@ -99,9 +125,10 @@ Two producers share this shape: **order updates** (state changes) and **fill upd
   "E": 1792440000200,
   "data": {
     "s": "BTC-USD", "c": "my-order-001", "S": "BUY", "o": "LIMIT", "f": "GTC",
+    "stp_mode": "expire_maker", "post_only": false,
     "q": "0.5", "p": "80000", "ap": "", "sp": "0",
     "x": "TRADE", "X": "OPEN", "i": 243140293, "cr": "",
-    "l": "0.1", "z": "0.1", "L": "80000", "N": "USDT", "n": "4",
+    "l": "0.1", "z": "0.1", "L": "80000", "N": "USD", "n": "4",
     "ott": 1792440000150, "t": 18073, "b": "", "a": "",
     "m": false, "R": false, "wt": "", "ot": "LIMIT", "ps": "BOTH", "cp": false,
     "rp": "0", "act": "", "E": 1792440000150, "T": 1792440000150,
@@ -119,15 +146,17 @@ Two producers share this shape: **order updates** (state changes) and **fill upd
 | `c` | Client order ID |
 | `S` | `BUY` \| `SELL` |
 | `o` / `ot` | Order type / original type before trigger: `MARKET`, `LIMIT`, `STOP_MARKET` (stop), `STOP` (stop-limit), `TAKE_PROFIT_MARKET` (take-profit), `TAKE_PROFIT` (take-profit-limit), `TRAILING_STOP_MARKET`. Note these differ from REST type names. |
-| `f` | `GTC` \| `FOK` \| `IOC` |
+| `f` | Time in force: `GTC` \| `IOC` \| `ALO` (add-liquidity-only = post-only). FOK no longer exists |
+| `stp_mode` | Self-trade prevention mode of the order: `expire_maker` (default) \| `expire_taker` \| `expire_both` |
+| `post_only` | `true` exactly when `f` is `ALO` |
 | `q`, `p`, `sp` | Original size, limit price, stop price |
 | `x` | Execution type. Order updates: `NEW` (pending or untriggered), `TRADE` (open **or** filled), `CANCELED`, `REJECTED`, `EXPIRED`. Fill updates: always `TRADE` |
-| `X` | Order status: `NEW` (pending or untriggered), `OPEN` (resting, possibly partially filled -- check `z`), `FILLED`, `CANCELED`, `REJECTED`, `EXPIRED`. `PARTIALLY_FILLED` appears only on a fill update whose order snapshot was unavailable; in that case `c`, `o`, `ot`, `f`, `q`, `p`, `sp`, `z`, `wt` are `""` |
+| `X` | Order status: `NEW` (pending or untriggered), `OPEN` (resting, possibly partially filled -- check `z`), `FILLED`, `CANCELED`, `REJECTED`, `EXPIRED`. `PARTIALLY_FILLED` appears only on a fill update whose order snapshot was unavailable; in that case `c`, `o`, `ot`, `f`, `q`, `p`, `sp`, `z`, `wt` are `""`, `post_only` is `false` and `stp_mode` is `expire_maker` |
 | `i` | Order ID (number) |
-| `cr` | Close reason (free text, e.g. `order_would_match_immediately` for a post-only reject, `order_expired_in_match` for self-trade prevention) |
+| `cr` | Close reason (free text, e.g. `order_would_match_immediately` for an ALO order that would have crossed (status `REJECTED`), `order_expired_in_match` for self-trade prevention (status `EXPIRED`; the incoming order's `stp_mode` decides whether the resting maker, the incoming remainder, or both expire; no self fill is created)) |
 | `z` | Cumulative filled size |
 | `l`, `L` | This fill's size and price (`""` on order updates) |
-| `n`, `N` | This fill's commission (negative = maker rebate) and asset `USDT` (`""` on order updates) |
+| `n`, `N` | This fill's commission (negative = maker rebate) and asset `USD` (`""` on order updates) |
 | `t` | Trade ID (`0` on order updates) |
 | `m` | Fill was maker |
 | `rp` | Realized PnL of this fill, gross of fees (`""` on order updates) |
@@ -135,7 +164,7 @@ Two producers share this shape: **order updates** (state changes) and **fill upd
 | `wt` | `""`, `CONTRACT_PRICE`, `MARK_PRICE` |
 | `act` | Auto-close type: `""` for user orders, else `liquidation`, `adl`, `bankrupt`, `if_transfer`, `vault_withdrawal`, `slp_transfer` |
 | `ps` | `BOTH` on fill updates, `""` on order updates (one-way mode) |
-| `ott`, `T`, `E` | Order updates: order event time (`E` = send time). Fill updates: fill time |
+| `ott`, `T`, `E` | Order updates: `ott`/`T` = order event time, `E` = time the stream server processed the update (for batched public vault updates, when it was received, not when the batch went out). Fill updates: all three = fill time |
 | `ap`, `b`, `a` | Always `""` |
 | `AP`, `CR` | Optional: trailing-stop activation price and callback rate |
 | `lf` | Optional: liquidation fee charged on this fill |
@@ -157,7 +186,7 @@ Check `data.event_type` first; if absent, `data.e` tells you which variant it is
   "e": "ACCOUNT_UPDATE", "E": 1792440000300,
   "data": {
     "e": "ORDER",
-    "B": [{"a": "USDT", "wb": "10012.5", "cw": "10012.5", "bc": "0"}],
+    "B": [{"a": "USD", "wb": "10012.5", "cw": "10012.5", "bc": "0"}],
     "P": [],
     "r": "FILL",
     "E": 1792440000300, "T": 1792440000300
@@ -165,7 +194,7 @@ Check `data.event_type` first; if absent, `data.e` tells you which variant it is
 }
 ```
 
-- `B[0].wb` is the new wallet balance (`cw` repeats it; `bc` is always `"0"`).
+- `B[0].wb` is the new wallet balance (`cw` repeats it; `bc` is always `"0"`). `B[0].a` is `"USD"` (REST `/v2/balances` still labels the same balance `USDT`; do not key on the label).
 - `r` is the engine reason: `FILL`, `FUNDING`, `DEPOSIT`, `WITHDRAWAL`, `ADL`, `LIQUIDATION_FEE`, `MARGIN_ADJUST`, `LEVERAGE_CHANGE`, `INTERNAL_TRANSFER_IN`, `INTERNAL_TRANSFER_OUT`, vault reasons (your account: `VAULT_CREATE`, `VAULT_DEPOSIT`, `VAULT_DEPOSIT_FROM_STAKING`, `VAULT_WITHDRAWAL`; the vault account: `VAULT_CREATE_RECEIVED`, `VAULT_DEPOSIT_RECEIVED`, `VAULT_WITHDRAWAL_EXECUTED`), reward/staking reasons, and others.
 - `data.e` maps `FILL` -> `ORDER`, `FUNDING` -> `FUNDING`, `DEPOSIT` -> `DEPOSIT`, `WITHDRAWAL` -> `WITHDRAW`, anything else -> `ACCOUNT_UPDATE`.
 - Optional: `staking_reward_balance`, `locked_reward_credit` (only when changed; keep the last value otherwise); inventory fields `custody_balances` and `inventory_costs_usd` (maps of asset -> decimal string), `conversion_reserved_usd` (string) and `slp_adl` (ADL profile view), present only on events that change an account's collateral inventory (vault/SLP accounts).
@@ -177,7 +206,7 @@ Check `data.event_type` first; if absent, `data.e` tells you which variant it is
   "e": "ACCOUNT_UPDATE", "E": 1792440000310,
   "data": {
     "e": "POSITION_UPDATE",
-    "B": [{"a": "USDT", "wb": "10012.5", "cw": "10012.5", "bc": "0"}],
+    "B": [{"a": "USD", "wb": "10012.5", "cw": "10012.5", "bc": "0"}],
     "P": [{
       "s": "BTC-USD", "pa": "-0.09397", "ep": "81558.69091944", "mt": "cross", "ib": "0", "ps": "SHORT", "i": 3232,
       "position_id": "3232", "position_seq": 22, "leverage": 20, "funding_total": "270.2568393349164184",
@@ -191,7 +220,7 @@ Check `data.event_type` first; if absent, `data.e` tells you which variant it is
 
 - `data.e`: `POSITION_OPENED`, `POSITION_UPDATE`, `POSITION_CLOSED`, `PARTIAL_LIQUIDATED`, `FULLY_LIQUIDATED`, `ADL`. `r` is `""`.
 - `P` holds exactly one position with its full current state: `pa` signed size (`"0"` when closed), `ep` entry price, `mt` `cross`|`isolated`, `ib` isolated margin, `ps` `LONG`|`SHORT`|`BOTH` (zero), `i` numeric ID, `position_id` exact ID, `position_seq` fill watermark, `funding_total` accumulated funding.
-- `B` carries the wallet balance read at send time. `T` is the position update time (funding/settings updates stamp their event time).
+- `B` carries the wallet balance read at send time. `T` is the stored position update time, the same value REST `/v2/positions` returns as `update_timestamp` for that state. Fills, non-zero funding, margin changes and leverage changes all advance it (even when size is unchanged); millisecond values can tie, so do not use `T` as a version (use the `position_seq` rule below).
 - Derived values (uPnL, margin, liquidation price) are not included -- compute them (see `strike-calculations`) or poll `/v2/positions`.
 - Key positions by `account_id` + `s` (one-way mode: one position per symbol per account); remove on `pa == "0"`. Ignore an update whose `position_seq` is lower than the one you hold for the same `position_id`.
 
@@ -209,7 +238,7 @@ Check `data.event_type` first; if absent, `data.e` tells you which variant it is
 | `MARGIN_UPDATED`, `MARGIN_UPDATE_FAILED` | `request_id`, `account_id`, `symbol`, `modify_type` (`add`\|`remove`), `amount`, `isolated_margin`, `error`, `timestamp` |
 | `INTERNAL_TRANSFER_COMPLETED`, `INTERNAL_TRANSFER_FAILED` | `transfer_id`, `account_id`, `transfer_kind`, `recipient_type`, `recipient_address`, `amount`, `error`, `timestamp`. Copy trading uses these: profit shares `recipient_type: "copy_profit_share"`, managed portfolio `copy_portfolio_funding` / `copy_portfolio_refund` (see **strike-copy-trading**) |
 | `STAKING_REWARD_CLAIM_FAILED` | `account_id`, `request_id`, `error`, `timestamp` (success is a plain balance update with `r: "STAKING_REWARD_CLAIM"`) |
-| `VAULT_*` (e.g. `VAULT_DEPOSITED`, `VAULT_WITHDRAWAL_REQUESTED`, `VAULT_WITHDRAWAL_EXECUTED`, `VAULT_LEADER_FEE_EARNED`, `*_FAILED`, `VAULT_CREATED`, `VAULT_LIQUIDATION_INCOME`) | Delivered to the stream of `event_data.account_id`: depositor/leader events to that account, `VAULT_CREATED` and `VAULT_LIQUIDATION_INCOME` to the vault's own stream. Field lists: **strike-vaults** |
+| `VAULT_*` (e.g. `VAULT_DEPOSITED`, `VAULT_WITHDRAWAL_REQUESTED`, `VAULT_WITHDRAWAL_EXECUTED`, `VAULT_LEADER_FEE_EARNED`, `*_FAILED`, `VAULT_CREATED`, `VAULT_LIQUIDATION_INCOME`) | Delivered to the stream of `event_data.account_id`: depositor/leader events only to that account's own stream, `VAULT_CREATED` and `VAULT_LIQUIDATION_INCOME` to the vault's own stream. `VAULT_CONTROLS_UPDATED` and `VAULT_POSITION_PROJECTED` are never forwarded. Field lists: **strike-vaults** |
 | `CREDIT_*` | customer-safe credit events |
 
 Use `request_id` to match `LEVERAGE_*` / `MARGIN_*` outcomes to your REST calls. Copy trading has no dedicated stream event: copied orders/fills/positions arrive as ordinary `ORDER_TRADE_UPDATE` (`c` starts with `copy:`) and `ACCOUNT_UPDATE` messages on the follower account; poll the copy REST routes for subscription state.
@@ -263,7 +292,7 @@ Errors, in check order: `400 Invalid JSON format` (unparseable / duplicate keys)
 ## Resync After Reconnect
 
 1. Reconnect, `session.logon`, re-subscribe every stream.
-2. Reload `GET /v2/openOrders`, `GET /v2/positions`, `GET /v2/balances` (see `strike-history`, `strike-trading`, `strike-account`).
+2. Reload `GET /v2/openOrders`, `GET /v2/positions`, `GET /v2/balances` (see `strike-history`, `strike-trading`, `strike-account`). `GET /v2/account?include_positions=true` returns balances and positions from one consistent account read.
 3. Fetch fills you missed with `GET /v2/history/fill?since_trade_id=<last trade_id seen>` (see `strike-history`).
 
 ## TypeScript Example
@@ -277,7 +306,8 @@ const HEX = (b: Uint8Array) => Buffer.from(b).toString("hex");
 const TERMINAL = new Set(["FILLED", "CANCELED", "REJECTED", "EXPIRED"]);
 
 interface OrderTradeUpdate {
-  s: string; c: string; S: "BUY" | "SELL"; o: string; f: string; q: string; p: string; sp: string;
+  s: string; c: string; S: "BUY" | "SELL"; o: string; f: string; // f: GTC | IOC | ALO
+  stp_mode: "expire_maker" | "expire_taker" | "expire_both"; post_only: boolean; q: string; p: string; sp: string;
   x: string; X: string; i: number; cr: string; z: string; l: string; L: string; n: string; N: string;
   t: number; m: boolean; R: boolean; rp: string; act: string; E: number; T: number;
   order_id?: string; trade_id?: string; fill_id?: string; builder_fee?: string; lf?: string;
@@ -288,8 +318,10 @@ interface WsPosition {
   i?: number; position_id?: string; position_seq?: number; leverage?: number; funding_total?: string;
 }
 
-// target: {} = the wallet's own account, { sub_account_id } = an owned sub-account (master wallet), { vault_id } = a vault
-type Target = { sub_account_id?: string; vault_id?: string };
+// target: {} = the wallet's own account, { sub_account_id } = an owned sub-account (master wallet), { vault_id } = a vault.
+// topics is optional; omit it to receive every topic (this class needs orders + fills + account).
+type Topic = "account" | "orders" | "fills" | "strategy";
+type Target = { sub_account_id?: string; vault_id?: string; topics?: Topic[] };
 
 class StrikeUserStream {
   private ws?: WebSocket;

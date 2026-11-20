@@ -1,6 +1,6 @@
 ---
 name: strike-auth
-description: Strike Finance API authentication — builder connect (wallet signature → account + API wallet), Ed25519 API wallet request signing, X-Builder-Fee-Bps, auth route groups, sub-account keys, and auth error handling. Use when implementing sign up, connect, or request signing.
+description: Strike Finance API authentication — builder connect (wallet signature → account + API wallet), Ed25519 API wallet request signing, X-Builder-Fee-Bps, auth route groups, sub-account keys, per-key IP allowlists, and auth error handling. Use when implementing sign up, connect, or request signing.
 ---
 
 # Strike Finance Authentication
@@ -18,18 +18,18 @@ Integrators (builders, bots, market makers) authenticate with an **API wallet**:
 
 | Group | Auth | Examples |
 |-------|------|----------|
-| Public | none | `GET /v2/ping`, `/v2/time`, `/v2/markets`, `/v2/fee-tiers`, `POST /auth/builder/*`; vault reads `GET /v2/vaults`, `/v2/vault/:id`, `/v2/vault/:id/{history,portfolio,depositors,liquidations,announcements}`; copy discovery `GET /v2/copy/lead-traders`, `/v2/copy/leaderboard`, `/v2/copy/copiers`, `/v2/copy/discover`, `/v2/copy/discover/filters`, `/v2/copy/discover/:address` |
-| Read (FlexibleAuth) | optional | `GET /v2/account`, `/v2/balances`, `/v2/portfolio`, `/v2/positions`, `/v2/openOrders`, `/v2/history/*`, `/v2/algo/twap*`, grid bot reads (`/v2/grid/bot`, `/v2/grid/bot/:id`, `/v2/grid/bot/:id/orders`), copy reads (`/v2/copy/subscriptions`, `/v2/copy/orders`, `/v2/copy/positions`, `/v2/copy/lead/stats`, `GET /v2/copy/saved`), vault depositor reads (`/v2/vault/position`, `/v2/vault/positions`, `/v2/vault/history`, `/v2/vault/my-deposits/history`) |
-| API wallet or JWT | required | `GET /v2/sub-accounts`, `GET /v2/rfq/:rfq_id`, `GET /v2/vault/:id/recovery-settings`, `POST /v2/copy/saved`, `DELETE /v2/copy/saved/:account_id`; also `GET /v2/symbols`, `/v2/withdraw/limits`, `/v2/withdraw/queue-position` (FlexibleAuth group, but the handler needs an account: `401 {"error":"account_id not found in auth context"}`) |
-| Trading | required | orders, leverage, margin, TWAP; grid bot `POST /v2/grid/bot`, `DELETE /v2/grid/bot/:id`; copy `POST /v2/copy/subscribe`, `PATCH`/`DELETE /v2/copy/subscribe/:id`; RFQ `POST /v2/rfq`, `DELETE /v2/rfq/:rfq_id`, `PUT /v2/rfq/:rfq_id/response`; masterOnly: vault `POST /v2/vault/create`, `/v2/vault/deposit`, `/v2/vault/withdraw`, `/v2/vault/:id/withdrawals/:withdrawal_id/cancel`, `/v2/vault/:id/pause`, `/v2/vault/:id/resume`, `PATCH /v2/vault/:id/recovery-settings`, and `/v2/deposit/quote`, `/v2/deposit/build-tx`, `/v2/deposit`, `/v2/withdraw/quote`, `/v2/withdraw/estimate`, `/v2/withdraw` |
-| JWT-only (Strike app) | JWT | `POST /v2/account`, `/v2/account/profile`, `/v2/wallet(s)`, `/v2/builder`, sub-account create/transfer, `/v2/pending-quotes`, `/v2/deposit/cardano/address`, `/v2/copy/labels*`, vault announcements `POST /v2/vault/:id/announcements`, `DELETE /v2/vault/:id/announcements/:announcement_id` |
+| Public | none | `GET /v2/ping`, `/v2/time`, `/v2/_status`, `/v2/markets`, `/v2/markets/:symbol`, `/v2/fee-tiers`, `/v2/account/by-nickname`, `POST /auth/builder/*`; vault reads `GET /v2/vaults`, `/v2/vault/:id`, `/v2/vault/:id/{history,portfolio,depositors,liquidations,announcements}`; copy discovery `GET /v2/copy/lead-traders`, `/v2/copy/leaderboard`, `/v2/copy/copiers`, `/v2/copy/discover`, `/v2/copy/discover/filters`, `/v2/copy/discover/:address` |
+| Read (FlexibleAuth) | optional | `GET /v2/account`, `/v2/balances`, `/v2/portfolio`, `/v2/positions`, `/v2/openOrders`, `/v2/history/*`, history exports (`POST /v2/{orders,fills,funding}/export`, `GET /v2/{orders,fills,funding}/export/:jobId`), `/v2/algo/twap*`, grid bot reads (`/v2/grid/bot`, `/v2/grid/bot/:id`, `/v2/grid/bot/:id/orders`), copy reads (`/v2/copy/subscriptions`, `/v2/copy/orders`, `/v2/copy/positions`, `/v2/copy/lead/stats`, `GET /v2/copy/saved`), vault depositor reads (`/v2/vault/position`, `/v2/vault/positions`, `/v2/vault/history`, `/v2/vault/my-deposits/history`), credit reads (`/v2/credit/{account,history,collateral-assets,settings}`) |
+| API wallet or JWT | required | `GET /v2/sub-accounts`, `GET /v2/rfq/:rfq_id`, `GET /v2/vault/:id/recovery-settings`, `POST /v2/copy/saved`, `DELETE /v2/copy/saved/:account_id`; masterOnly: sub-account management `POST /v2/sub-accounts`, `PATCH`/`DELETE /v2/sub-accounts/:account_id`, `POST /v2/sub-accounts/:account_id/{archive,unarchive}`, `POST /v2/sub-accounts/transfer` (strike-account), and `POST /v2/crates/open`, `GET /v2/crates/history`; also `GET /v2/symbols`, `/v2/withdraw/limits`, `/v2/withdraw/queue-position` (FlexibleAuth group, but the handler needs an account: `401 {"error":"account_id not found in auth context"}`) |
+| Trading | required | orders, `POST`/`DELETE /v2/_guards`, leverage, margin, TWAP; grid bot `POST /v2/grid/bot`, `DELETE /v2/grid/bot/:id`; copy `POST /v2/copy/subscribe`, `PATCH`/`DELETE /v2/copy/subscribe/:id`; RFQ `POST /v2/rfq`, `DELETE /v2/rfq/:rfq_id`, `PUT /v2/rfq/:rfq_id/response`; masterOnly: vault `POST /v2/vault/create`, `/v2/vault/deposit`, `/v2/vault/withdraw`, `/v2/vault/:id/withdrawals/:withdrawal_id/cancel`, `/v2/vault/:id/pause`, `/v2/vault/:id/resume`, `PATCH /v2/vault/:id/recovery-settings`, `/v2/deposit/quote`, `/v2/deposit/build-tx`, `/v2/deposit`, `/v2/withdraw/quote`, `/v2/withdraw/estimate`, `/v2/withdraw`, and credit writes `POST /v2/credit/portfolio/manage`, `/v2/credit/collateral/purchase` |
+| JWT-only (Strike app) | JWT | `POST /v2/account/profile`, `/v2/wallet(s)` (incl. `PUT /v2/wallet/:id/allowed-ips`), `/v2/builder*` (register, dashboard, approvals, `POST /v2/builder/revoke`), `/v2/pending-quotes`, `/v2/transaction/status`, `/v2/deposit/{cardano,ethereum}/address`, `/v2/internal-transfers*`, `/v2/copy/labels*`, vault announcements `POST /v2/vault/:id/announcements`, `DELETE /v2/vault/:id/announcements/:announcement_id` |
 
-Details: strike-trading, strike-rfq, strike-grid-bot, strike-copy-trading, strike-vaults.
+Details: strike-trading, strike-rfq, strike-grid-bot, strike-copy-trading, strike-vaults. There is no account-creation endpoint: accounts come from builder connect.
 
-- **FlexibleAuth**: if `X-API-Wallet-Public-Key` is present the request is fully verified as an API wallet request (any failure → `401`, even on otherwise public reads). Without it, a JWT is optional and anonymous callers can read public data by passing `account_id`, `vault_id`, or `blockchain_address` (see strike-account). Reads that only serve the caller's own data (e.g. `/v2/copy/subscriptions`, `GET /v2/copy/saved`) still return `401` without auth.
+- **FlexibleAuth**: if `X-API-Wallet-Public-Key` is present the request is fully verified as an API wallet request (any failure → `401`/`403`, even on otherwise public reads). Without it, a JWT is optional and anonymous callers can read public data by passing `account_id`, `vault_id`, or `blockchain_address` (see strike-account). Reads that only serve the caller's own data (e.g. `/v2/copy/subscriptions`, `GET /v2/copy/saved`) still return `401` without auth.
 - **API wallet or JWT**: same, but some authentication is required (no API wallet headers and no JWT → `401 {"error":"missing authorization header"}`).
 - **Trading**: API wallet requests skip the app's periodic wallet-signature gate (`RequireEnableTrading` only applies to JWT sessions).
-- **masterOnly** (vault management, all deposit and withdraw writes, credit writes): rejects API wallets bound to a sub-account with `403 {"error":"not available to sub-account API keys"}`.
+- **masterOnly** (sub-account management and transfers, vault management, all deposit and withdraw writes, credit writes, crates): rejects API wallets bound to a sub-account with `403 {"error":"not available to sub-account API keys"}`.
 - Some routes also return `503 {"error":"service unavailable"}` while the API is warming up.
 
 ## Ed25519 Keypair Generation
@@ -117,7 +117,7 @@ Complete verify-signature within 5 minutes; after that the challenge expires.
 
 With a `referral_code`, the referral line becomes `Referral attribution: Strike will attempt to record builder "{code}" as your permanent referrer if you are eligible and do not already have one.` followed by `Referral code: {referral_code}.`
 
-**Errors (400 unless noted):** `address is required`, `chain is required`, `code is required`, `fee_share_bps is required`, `public_key is required`, `chain must be ethereum, solana, or cardano`, `invalid public key: must be 64 hex characters (Ed25519)`, `invalid public key: must be hex-encoded`, `fee_share_bps must be 0-100`, `builder is not active`, `referral code does not belong to the builder`, `404 builder code not found`.
+**Errors (400 unless noted):** `address is required`, `chain is required`, `code is required`, `fee_share_bps is required`, `public_key is required`, `chain must be ethereum, solana, or cardano`, `invalid public key: must be 64 hex characters (Ed25519)`, `invalid public key: must be hex-encoded`, `fee_share_bps must be 0-100`, `builder is not active`, `cannot connect an account to its own builder code` (the address already belongs to the account that owns `code`), `referral code does not belong to the builder`, `404 builder code not found`.
 
 ### Sign the challenge with the user's wallet
 
@@ -144,7 +144,7 @@ POST /auth/builder/verify-signature
 
 Both fields are required. Address, chain, code, fee and public key come from the stored challenge.
 
-On success the server: verifies the signature, creates the Strike account if the wallet has none, **revokes any active API wallets of this account for the same builder code**, registers `public_key` as a new API wallet (no expiry), approves the builder with `fee_share_bps` as the user's max, then applies the referral best-effort.
+On success the server: verifies the signature, creates the Strike account if the wallet has none, rejects the account that owns the builder code, **revokes any active API wallets of this account for the same builder code**, registers `public_key` as a new API wallet (no expiry), approves the builder with `fee_share_bps` as the user's max (if that fails the new wallet is deactivated again), then applies the referral best-effort.
 
 **Response (200):**
 
@@ -174,9 +174,9 @@ On success the server: verifies the signature, creates the Strike account if the
 | `referral.status` | string | `accepted` \| `already_accepted` \| `already_set` \| `skipped_self_referral` \| `skipped_circular_referral` \| `not_requested` \| `failed` |
 | `referral.code` | string | Present for `accepted` / `already_accepted` |
 
-**Errors:** `400 challenge not found or expired` (expired, unknown, or already used nonce — request a new challenge), `401 wallet signature verification failed`, `400 invalid address format`, `500 failed to create API wallet` (public key already registered), `500 failed to revoke existing builder API wallets`.
+**Errors:** `400 challenge not found or expired` (expired, unknown, or already used nonce — request a new challenge), `401 wallet signature verification failed`, `400 invalid address format`, `400 cannot connect an account to its own builder code`, `500 failed to create account`, `500 failed to create API wallet` (public key already registered), `500 failed to revoke existing builder API wallets`, `500 failed to approve builder`.
 
-Registering a builder code (`POST /v2/builder`) and managing API wallets (`POST /v2/wallet`, `GET /v2/wallets`, `DELETE /v2/wallet/:id`) are JWT-only (Strike app).
+Registering a builder code (`POST /v2/builder`, no minimum balance), the builder dashboard (`GET /v2/builder`, `/v2/builder/fills`, `/v2/builder/stats`, `/v2/builder/traders`) and managing API wallets (`POST /v2/wallet`, `GET /v2/wallets`, `DELETE /v2/wallet/:id`, `PUT /v2/wallet/:id/allowed-ips`) are JWT-only (Strike app).
 
 ## API Wallet Request Signing
 
@@ -208,9 +208,19 @@ The signature is Ed25519 over the UTF-8 bytes of the message.
 
 - Timestamp must be at most **180 seconds** old and **not in the future** (the server compares whole seconds, so even 1 s ahead is rejected). Sync with `GET /v2/time` (`serverTime` is in milliseconds) and keep a ~1 s safety margin behind server time.
 - A nonce is accepted once per public key; the server remembers it for 180 s. Every request — including a retry — needs a new nonce and signature.
-- The nonce is consumed once the signature verifies, even if the endpoint itself then fails.
+- The nonce is consumed once the signature and the IP allowlist check pass, even if the endpoint itself then fails.
 - Request bodies are capped at 8 MiB.
 - Rate limits are counted per `X-API-Wallet-Public-Key` (per IP without it): `429 {"error":"rate limit exceeded"}`.
+
+### IP allowlist
+
+The account owner can restrict a key to source IPs in the Strike app (API Keys page; `PUT /v2/wallet/:id/allowed-ips` is JWT-only): up to 20 IPv4/IPv6 addresses or CIDR ranges. An empty list (the default, including builder-connect keys) allows any IP. A correctly signed request from another IP gets:
+
+```json
+{ "error": "request IP is not allowed for this API key", "client_ip": "203.0.113.7" }
+```
+
+with `403`. `client_ip` is the IP the API saw (the visitor IP behind Cloudflare; a dual-stack host may arrive over IPv6). The check runs after the signature and before the nonce is consumed. The user WebSocket applies the same list at `session.logon`, but a blocked logon gets the generic `401 Authentication failed` (no IP detail), and an already-open session keeps running until it reconnects. This is not a dead key: ask the user to add the IP.
 
 ### Auth errors
 
@@ -224,6 +234,7 @@ The signature is Ed25519 over the UTF-8 bytes of the message.
 | 401 | `request already processed` | Nonce reused |
 | 401 | `wallet expired or revoked` | Key deactivated |
 | 500 | `authentication service unavailable` | Nonce store unavailable; retry |
+| 403 | `request IP is not allowed for this API key` | Source IP outside the key's allowlist (body adds `client_ip`) |
 | 403 | `not available to sub-account API keys` | Sub-account key on a masterOnly route |
 
 The User WebSocket (`wss://<host>/ws/user-api`) uses the same key with its own logon message — see strike-userstream.
@@ -236,12 +247,13 @@ Only meaningful for API wallets created through builder connect (they carry the 
 - Integer basis points, `0`–`100` (deployment cap, default 100 = 1%). Omitted → the orders carry your builder code with a fee of `0`.
 - Must be `<=` the builder code's configured fee share **and** `<=` the `fee_share_bps` the user approved for the trading account.
 - Failures return `400`: `invalid X-Builder-Fee-Bps header: must be an integer between 0 and 100 (basis points; 100 = 1%)`, `X-Builder-Fee-Bps 50 exceeds builder max of 20`, `X-Builder-Fee-Bps 50 exceeds your approved max of 20`, `account has not approved builder "code"`, `builder "code" is not active`, `builder code "code" not found`.
-- The approval check runs on every order from a builder-code wallet, even without the header. Approvals are per account, so orders sent with `sub_account_id` from a builder-code wallet fail with `account has not approved builder "code"` unless that sub-account approved the builder (builder connect only approves the wallet's own account).
+- The approval check runs on every order from a builder-code wallet, even without the header. Builder connect approves the master account only; an order sent with `sub_account_id` uses that sub-account's own approval if it has one, otherwise the master's (capped at the master's approved max). The engine attributes the fee the same way.
+- The fee is charged on each fill, at 8-decimal precision, and capped at what the payer can cover at that moment (wallet outside isolated positions less cross unrealized losses, plus the traded isolated position's balance less its loss; unrealized profit does not count).
 
 ## Sub-Accounts
 
-- A wallet bound to a **master** account (every builder-connect wallet) acts on the master by default and can target an owned, active sub-account by passing `sub_account_id` (query param on reads, body field on writes, as each endpoint documents). Unowned or inactive ids are rejected: `403 {"error":"sub-account access denied"}` on write/trading routes, `GET /v2/symbols`, `include_copies` reads, and strategy/copy reads (TWAP, grid bot, copy subscriptions/orders/positions); `401 {"error":"authentication required or provide vault_id, account_id, or blockchain_address"}` on reads that accept public selectors (`/v2/account`, `/v2/balances`, `/v2/portfolio`, `/v2/positions`, `/v2/closedPositions`, `/v2/openOrders`, `GET /v2/order`, `/v2/history/*`).
-- A wallet bound to a **sub-account** (created in the Strike app via `POST /v2/wallet` with `sub_account_id`) authenticates as that sub-account only. It cannot read or trade its master or siblings, cannot use `scope=all`, and every masterOnly route (deposits, withdrawals, vault management, credit writes) returns `403`. Deleting the sub-account revokes its wallets.
+- A wallet bound to a **master** account (every builder-connect wallet) acts on the master by default and can target an owned, active sub-account by passing `sub_account_id` (query param on reads, body field on writes, as each endpoint documents). It can also create, rename, archive, delete and fund sub-accounts (strike-account). Unowned or inactive ids are rejected: `403 {"error":"sub-account access denied"}` on write/trading routes, `GET /v2/symbols`, `include_copies` reads, and strategy/copy reads (TWAP, grid bot, copy subscriptions/orders/positions); `401 {"error":"authentication required or provide vault_id, account_id, or blockchain_address"}` on reads that accept public selectors (`/v2/account`, `/v2/balances`, `/v2/portfolio`, `/v2/positions`, `/v2/closedPositions`, `/v2/openOrders`, `GET /v2/order`, `/v2/history/*`).
+- A wallet bound to a **sub-account** (created in the Strike app via `POST /v2/wallet` with `sub_account_id`) authenticates as that sub-account only. It cannot read or trade its master or siblings, cannot use `scope=all`, and every masterOnly route (sub-account management and transfers, deposits, withdrawals, vault management, credit writes) returns `403`. Deleting the sub-account revokes its wallets.
 
 ## TypeScript Example
 
@@ -304,9 +316,9 @@ export async function authenticatedFetch(
 
 ## Handling 401s
 
-Not every `401` means the key is gone. Endpoints also return `401` for app-level reasons (e.g. `wallet signature verification failed` on withdraw confirm, `authentication required or provide vault_id, account_id, or blockchain_address` on reads), and clock skew or nonce reuse are fixed by re-syncing and re-signing.
+Not every `401` means the key is gone. Endpoints also return `401` for app-level reasons (e.g. `wallet signature verification failed` on withdraw confirm, `authentication required or provide vault_id, account_id, or blockchain_address` on reads), and clock skew or nonce reuse are fixed by re-syncing and re-signing. `403 request IP is not allowed for this API key` means the key works but not from this IP.
 
-Treat the key as invalid only for `authentication failed` (after ruling out clock/signing bugs) or `wallet expired or revoked` — e.g. the user re-connected with your builder code (which revokes the previous key) or revoked it in the Strike app. Then discard the stored key and run builder connect again with a new keypair.
+Treat the key as invalid only for `authentication failed` (after ruling out clock/signing bugs) or `wallet expired or revoked` — e.g. the user re-connected with your builder code (which revokes the previous key), deleted the key in the Strike app, or revoked your builder under connected apps (`POST /v2/builder/revoke`, JWT-only: deactivates every key of your code on that account and sets the approval to 0 bps). Then discard the stored key and run builder connect again with a new keypair; a new connect sets the approval again.
 
 ```typescript
 async function isKeyInvalid(res: Response): Promise<boolean> {

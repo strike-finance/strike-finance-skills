@@ -9,9 +9,20 @@ info:
     before the engine processes it. A `201`/`200` here means "accepted and sequenced", not
     "filled" or "resting": order creates return `status: "pending"` (TWAP create returns the
     strategy's `status: "active"`; `PUT /v2/symbols` returns `204`). Engine-side rejections
-    (margin, tick/step size, post-only cross, reduce-only, ...) arrive on the user stream
+    (margin, tick/step size, ALO cross, reduce-only, ...) arrive on the user stream
     (`wss://<host>/ws/user-api`, see the `strike-userstream` skill) as order updates with
-    status `rejected`/`expired`/`canceled` and a reason code in `CloseReason`.
+    status `rejected`/`expired`/`canceled` and a reason code in `CloseReason`. Public
+    `GET /v2/_status` reports engine progress: once `commit_sequence_id` is >= a response's
+    `sequence_id`, the engine has processed that command.
+
+    **Time in force / self-trade prevention.** `time_in_force` is `GTC` (default), `IOC` or `ALO`
+    (add-liquidity-only, the canonical post-only; `post_only: true` is an alias). `FOK` is retired
+    and returns `400`. Every create also takes `stp_mode` (`expire_maker` default, `expire_taker`,
+    `expire_both`).
+
+    **Request guards (optional).** Order commands accept a top-level `guard` (`{"id","counter"}`)
+    acquired from `POST /v2/_guards`; the API refuses (`409`) a guarded command whose counter is not
+    greater than the last one admitted on that guard.
 
     **Silently dropped commands.** Some engine rejects happen before an order event exists:
     the API still answers `201`/`200`, but no user-stream update follows and `GET /v2/order`
@@ -27,7 +38,8 @@ info:
     **Errors.** HTTP errors are always a JSON object with an `error` string; a few add extra
     fields (`failed_index`, `max_leverage`/`requested`). Malformed bodies return the Go/gin
     binding text, e.g. `Key: 'CreateOrderRequest.Side' Error:Field validation for 'Side' failed
-    on the 'required' tag`. `required` is not enforced at bind time on decimal fields (`size`,
+    on the 'required' tag`; an unknown enum value returns the enum decoder text, e.g.
+    `Value "FOK" does not represent a OrderTimeInForce`. `required` is not enforced at bind time on decimal fields (`size`,
     `amount`, leg `stop_price`) or on items inside arrays (`orders[]`, `replacements[]`): a
     missing `size` reaches the engine and is rejected as `order_less_than_min_size`, a missing
     `side`/`type` in an array item is dropped as above. Send enum and decimal fields only when you have a value: an empty
@@ -38,11 +50,13 @@ info:
     `GET /v2/markets` on this host; the engine validates orders against them.
 
     **Decimals** (sizes, prices, rates) are serialized as JSON strings in responses; requests
-    accept either a string or a JSON number.
+    accept either a string or a JSON number. Order `size`, `price`, `stop_price`,
+    `callback_rate` and `activation_price` must be below 1e12 in absolute value
+    (`400 order_amount_out_of_range`).
 
     Order history (`/v2/history/order`) and fill history (`/v2/history/fill`) are documented in
     `user-api.yaml`.
-  version: 2.2.0
+  version: 2.3.0
   contact:
     name: Strike Finance
     url: https://www.strikefinance.org
@@ -60,6 +74,10 @@ tags:
   description: Server-side TWAP strategies
 - name: Trading
   description: Leverage, margin mode and isolated margin
+- name: Guards
+  description: Optional request guards that reject stale order intents
+- name: Status
+  description: Public engine progress
 security:
 - ApiWalletAuth: []
 components:
@@ -90,6 +108,8 @@ components:
 
         API wallets bound to a sub-account act as that sub-account. Write routes called with
         neither API wallet headers nor a JWT return `401 {"error":"missing authorization header"}`.
+        A correctly signed request from an IP outside the key's source-IP allowlist (when one is
+        set) returns `403 {"error":"request IP is not allowed for this API key","client_ip":"..."}`.
         Rate limiting is per API wallet key (per IP without one): `429 {"error":"rate limit exceeded"}`.
   parameters:
     BuilderFeeBps:
@@ -103,10 +123,11 @@ components:
         For builder-code wallets the builder must also be active and approved by the account even
         when the header is omitted (omitted = 0 bps, fills still attributed to the builder).
         Violations return `400` and nothing is published. The approval is looked up on the calling
-        account, or on `sub_account_id` when one is sent - never on a vault. Builder connect only
-        approves the wallet's own (master) account, so a builder-code wallet that sends
-        `sub_account_id` gets `400 account has not approved builder "<code>"` unless that
-        sub-account approved the builder. Applied on `POST /v2/order`, `/v2/orders/batch`,
+        account, or on `sub_account_id` when one is sent; a sub-account without its own approval
+        inherits its master's (including its max). Never on a vault: vault trades use the leader's
+        approval. At fill time the fee is floored to 8 decimals, capped at what the payer can cover
+        (unrealized profit excluded) and is 0 when the builder's own account is the trader; see the
+        `strike-calculations` skill. Applied on `POST /v2/order`, `/v2/orders/batch`,
         `/v2/orders/replace`, `/v2/order/replace-batch` and `/v2/order/strategy` (all legs).
         `POST /v2/order/replace` ignores it: the replacement order carries no builder code at all
         (no builder fee, no builder attribution). `POST /v2/algo/twap` ignores it too: TWAP child
@@ -226,8 +247,60 @@ components:
       enum:
       - GTC
       - IOC
+      - ALO
+      description: |
+        Case-sensitive. Omitted = `GTC`. `IOC` expires the unfilled remainder. `ALO`
+        (add-liquidity-only, canonical post-only) is allowed only on `limit`, `stop_limit` and
+        `take_profit_limit` (`400 ALO requires limit, stop_limit, or take_profit_limit order type`)
+        and only with `stp_mode` `expire_maker` (`400 ALO requires expire_maker stp_mode`); an ALO
+        order that would match on arrival (even against your own order) is rejected with
+        `order_would_match_immediately` before any fill or STP expiry. `FOK` is retired:
+        `400 Value "FOK" does not represent a OrderTimeInForce`.
+    OrderTimeInForceLabel:
+      type: string
+      enum:
+      - GTC
+      - IOC
+      - ALO
       - FOK
-      description: Case-sensitive. Omitted = `GTC`.
+      description: Time in force as stored on an order. `FOK` appears only on closed orders placed before FOK was retired.
+    STPMode:
+      type: string
+      enum:
+      - expire_maker
+      - expire_taker
+      - expire_both
+      default: expire_maker
+      description: |
+        Self-trade prevention action, chosen by the incoming order, at the first resting order of
+        the same account, the same root account (a master, its sub-accounts, and vault orders that
+        master places as leader) or the same server-assigned STP group. `expire_maker` (default)
+        expires the resting remainder and keeps matching; `expire_taker` expires this order's
+        remainder and leaves the resting order; `expire_both` expires both remainders. The last two
+        stop matching there (earlier fills stand) and the remainder never rests. Expired orders get
+        status `expired` and `CloseReason` `order_expired_in_match`; no self fill, fee or PnL.
+        Per order: TP/SL legs do not inherit the primary's mode.
+    RequestGuard:
+      type: object
+      description: |
+        Optional request guard (acquire with `POST /v2/_guards`). Only valid at the top level of
+        the endpoint body; inside an item, replacement or leg it is a `400`. The API refuses with
+        `409` when `id` is unknown, expired or evicted for the authenticated account, or when
+        `counter` is not greater than the highest counter already admitted on that guard.
+      required:
+      - id
+      - counter
+      properties:
+        id:
+          type: string
+          format: uuid
+          example: 019a1340-0000-7000-8000-000000000001
+        counter:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Positive uint64, strictly increasing per guard (gaps allowed). Keep below 2^53 in JavaScript.
+          example: 42
     WorkingType:
       type: string
       enum:
@@ -246,8 +319,8 @@ components:
       - expired
       description: |
         `pending` = sequenced, not yet processed by the engine; `open` = resting (may be partially
-        filled); `untriggered` = conditional order waiting for its trigger; `expired` = IOC/FOK
-        remainder, OCO leg, or a resting maker removed by self-trade prevention.
+        filled); `untriggered` = conditional order waiting for its trigger; `expired` = IOC
+        remainder, OCO leg, or a remainder expired by self-trade prevention.
     CreateOrderRequest:
       type: object
       required:
@@ -258,12 +331,13 @@ components:
       properties:
         client_order_id:
           type: string
-          maxLength: 256
+          maxLength: 254
           description: |
-            Your ID for the order. Omitted = server generates a UUIDv7. Must not start with a
-            reserved prefix (`copy:`, `liq_`, `bankrupt_`, `adl_`, `if_transfer_`, `if_adl_`,
-            `vault_wd_`). Uniqueness is not enforced for single creates (it is within one
-            replace batch); reuse makes client-ID lookups ambiguous.
+            Your ID for the order, at most 254 bytes of UTF-8 without NUL
+            (`400 client_order_id must be at most 254 bytes`). Omitted = server generates a UUIDv7.
+            Must not start with a reserved prefix (`copy:`, `liq_`, `bankrupt_`, `adl_`,
+            `if_transfer_`, `if_adl_`, `vault_wd_`). Uniqueness is not enforced for single creates
+            (it is within one replace batch); reuse makes client-ID lookups ambiguous.
           example: my-order-001
         symbol:
           type: string
@@ -292,12 +366,19 @@ components:
           example: '48000'
         time_in_force:
           $ref: '#/components/schemas/TimeInForce'
+        stp_mode:
+          $ref: '#/components/schemas/STPMode'
         working_type:
           $ref: '#/components/schemas/WorkingType'
         post_only:
           type: boolean
           default: false
-          description: Reject (`order_would_match_immediately`) instead of taking liquidity.
+          description: |
+            Alias for `time_in_force: ALO`. `true` with `time_in_force` omitted or `GTC` makes the
+            order ALO; with `ALO` it stays ALO either way; with `IOC` it is
+            `400 post_only requires GTC or ALO time_in_force`. The ALO order-type and `stp_mode`
+            rules then apply, so `post_only` on a `market`, `stop`, `take_profit` or
+            `trailing_stop_market` order is a `400`.
         reduce_only:
           type: boolean
           default: false
@@ -328,6 +409,10 @@ components:
         sub_account_id:
           type: string
           description: Trade on an owned, active sub-account (master callers). Mutually exclusive with `vault_id`.
+        guard:
+          allOf:
+          - $ref: '#/components/schemas/RequestGuard'
+          description: Top-level `POST /v2/order` body only. Inside `orders[]` of a batch or a replace `new_order` it is a `400` - put the guard on that endpoint's top level instead.
     CreateOrderResponse:
       type: object
       properties:
@@ -394,9 +479,9 @@ components:
       type: object
       description: |
         Order as returned by `GET /v2/order` and `GET /v2/openOrders`. Keys are PascalCase (engine
-        model). Optional objects (`Strategy`, `Trailing`, `Builder`) are omitted when unset. Orders
-        served from history (terminal orders on `GET /v2/order`) report `BoundPrice` as `"0"` and
-        omit `Builder` and the STP fields.
+        model) except `stp_mode`. Optional objects (`Strategy`, `Trailing`, `Builder`) are omitted
+        when unset. Orders served from history (terminal orders on `GET /v2/order`) report
+        `BoundPrice` as `"0"` and omit `Builder`, `STPGroup`, `STPAccountID` and the copy fields.
       properties:
         ID:
           type: integer
@@ -423,7 +508,7 @@ components:
           $ref: '#/components/schemas/OrderStrategy'
         CloseReason:
           type: string
-          description: Reason code when rejected/canceled/expired (e.g. `order_would_match_immediately`, `insufficient_balance`, `order_strategy_secondary_oco`, `position_closed`); empty otherwise
+          description: Reason code when rejected/canceled/expired (e.g. `order_would_match_immediately`, `order_expired_in_match`, `insufficient_balance`, `order_strategy_secondary_oco`, `position_closed`); empty otherwise
           example: ''
         Side:
           type: string
@@ -458,7 +543,11 @@ components:
           - slp_transfer
           example: ''
         TimeInForce:
-          $ref: '#/components/schemas/TimeInForce'
+          $ref: '#/components/schemas/OrderTimeInForceLabel'
+        stp_mode:
+          allOf:
+          - $ref: '#/components/schemas/STPMode'
+          description: Always present (snake_case, unlike the other keys).
         WorkingType:
           type: string
           description: '`none` for non-conditional orders'
@@ -487,6 +576,7 @@ components:
           $ref: '#/components/schemas/OrderTrailing'
         PostOnly:
           type: boolean
+          description: Derived - `true` exactly when `TimeInForce` is `ALO`.
         ReduceOnly:
           type: boolean
         ClosePosition:
@@ -565,6 +655,8 @@ components:
           description: Cancel on a vault (leader only)
         sub_account_id:
           type: string
+        guard:
+          $ref: '#/components/schemas/RequestGuard'
     CancelOrderResponse:
       type: object
       properties:
@@ -597,6 +689,8 @@ components:
           type: string
         sub_account_id:
           type: string
+        guard:
+          $ref: '#/components/schemas/RequestGuard'
     CancelAllOrdersResponse:
       type: object
       properties:
@@ -630,7 +724,11 @@ components:
           description: Applied to every order that has no `vault_id` of its own
         sub_account_id:
           type: string
-          description: Applies to the whole batch (falls back to the first order's `sub_account_id`)
+          description: Applies to the whole batch (falls back to the first order's `sub_account_id`). With a `guard`, items must omit `sub_account_id` or repeat this one (`400 guarded batch orders must use the endpoint sub-account`).
+        guard:
+          allOf:
+          - $ref: '#/components/schemas/RequestGuard'
+          description: One counter covers the whole batch. Every valid item is prepared first, then the guard is admitted once and the items are appended together; a `409` rejects the whole batch with nothing appended. Per-item failures still appear in `failed`.
     BatchFailure:
       type: object
       properties:
@@ -652,7 +750,7 @@ components:
         failed:
           type: array
           nullable: true
-          description: Orders rejected before publishing (API-side checks only). Engine rejections arrive on the user stream.
+          description: Orders rejected before publishing (API-side checks only - the same sync `400`s as a single create, e.g. `invalid_symbol`, `invalid_stop_price`, the ALO / `post_only` rules, `order_amount_out_of_range`, vault errors). Engine rejections arrive on the user stream.
           items:
             $ref: '#/components/schemas/BatchFailure'
     ReplaceCancelLeg:
@@ -682,6 +780,10 @@ components:
           description: Put `vault_id` here (top level); a different `vault_id` inside a leg is rejected as a mismatch.
         sub_account_id:
           type: string
+        guard:
+          allOf:
+          - $ref: '#/components/schemas/RequestGuard'
+          description: Top-level `POST /v2/order/replace` body only (`400 guard must be on the replacement request, not its order legs` when on a leg). Inside `replacements[]` it is a `400` - use the request-level `guard` there.
     ReplaceCancelResult:
       type: object
       properties:
@@ -726,6 +828,10 @@ components:
         sub_account_id:
           type: string
           description: Falls back to `replacements[0]`'s `sub_account_id` (then its `new_order` / `cancel`) when omitted
+        guard:
+          allOf:
+          - $ref: '#/components/schemas/RequestGuard'
+          description: The only allowed guard position (`400 guard must be on the batch replacement request` if an item or leg has one).
     ReplaceBatchOrdersResponse:
       type: object
       properties:
@@ -741,7 +847,7 @@ components:
             $ref: '#/components/schemas/ReplaceResult'
     ReplaceSymbolCreateOrder:
       type: object
-      description: A `CreateOrderRequest` without `symbol`, `vault_id` and `sub_account_id` (they come from the parent).
+      description: A `CreateOrderRequest` without `symbol`, `vault_id`, `sub_account_id` (they come from the parent) and `guard` (top level only).
       required:
       - side
       - type
@@ -749,7 +855,7 @@ components:
       properties:
         client_order_id:
           type: string
-          maxLength: 256
+          maxLength: 254
         side:
           $ref: '#/components/schemas/OrderSide'
         type:
@@ -762,10 +868,13 @@ components:
           type: string
         time_in_force:
           $ref: '#/components/schemas/TimeInForce'
+        stp_mode:
+          $ref: '#/components/schemas/STPMode'
         working_type:
           $ref: '#/components/schemas/WorkingType'
         post_only:
           type: boolean
+          description: 'Alias for `time_in_force: ALO` (see `CreateOrderRequest.post_only`)'
         reduce_only:
           type: boolean
         close_position:
@@ -797,6 +906,10 @@ components:
           type: string
         sub_account_id:
           type: string
+        guard:
+          allOf:
+          - $ref: '#/components/schemas/RequestGuard'
+          description: The only allowed guard position (`400 guard must be on the symbol replacement request` if an `orders[]` item has one).
     ReplaceSymbolOrdersResponse:
       type: object
       properties:
@@ -822,7 +935,9 @@ components:
       description: |
         TP or SL leg. Side is set to the opposite of the primary and `reduce_only` is forced on.
         `tp_order.type` must be `take_profit` or `take_profit_limit`; `sl_order.type` must be
-        `stop` or `stop_limit`.
+        `stop` or `stop_limit`. A leg that breaks the market's rules (price range, tick, min size)
+        rejects the strategy: the primary is published `rejected` with that code as `CloseReason`.
+        A `guard` on a leg is a `400`.
       required:
       - type
       - size
@@ -830,7 +945,7 @@ components:
       properties:
         client_order_id:
           type: string
-          maxLength: 256
+          maxLength: 254
         type:
           type: string
           enum:
@@ -850,10 +965,15 @@ components:
           example: '55000'
         time_in_force:
           $ref: '#/components/schemas/TimeInForce'
+        stp_mode:
+          allOf:
+          - $ref: '#/components/schemas/STPMode'
+          description: Per leg; omitted = `expire_maker` (not inherited from the primary).
         working_type:
           $ref: '#/components/schemas/WorkingType'
         post_only:
           type: boolean
+          description: 'Alias for `time_in_force: ALO`; only valid on `take_profit_limit` / `stop_limit` legs.'
         price_protect:
           type: boolean
     CreateStrategyOrderRequest:
@@ -867,11 +987,12 @@ components:
       properties:
         strategy_id:
           type: string
-          description: Your ID linking the primary and its legs
+          maxLength: 254
+          description: Your ID linking the primary and its legs (at most 254 bytes, else `400 invalid_strategy_id`)
           example: 019a0c2e-2222-7000-8000-000000000002
         client_order_id:
           type: string
-          maxLength: 256
+          maxLength: 254
           description: Primary order client ID (generated when omitted)
         symbol:
           type: string
@@ -889,10 +1010,13 @@ components:
           description: Required when the primary is a conditional type
         time_in_force:
           $ref: '#/components/schemas/TimeInForce'
+        stp_mode:
+          $ref: '#/components/schemas/STPMode'
         working_type:
           $ref: '#/components/schemas/WorkingType'
         post_only:
           type: boolean
+          description: 'Alias for `time_in_force: ALO` (see `CreateOrderRequest.post_only`)'
         reduce_only:
           type: boolean
         close_position:
@@ -903,6 +1027,10 @@ components:
           type: string
         sub_account_id:
           type: string
+        guard:
+          allOf:
+          - $ref: '#/components/schemas/RequestGuard'
+          description: Covers the primary and both legs (`400 guard must be on the strategy request, not its order legs` if a leg has one).
         tp_order:
           $ref: '#/components/schemas/StrategyLeg'
         sl_order:
@@ -1014,7 +1142,9 @@ components:
           - isolated
         default_leverage:
           type: integer
-          example: 20
+          nullable: true
+          description: The account's saved default leverage; `null` when none is saved (symbols then use each market's `default_leverage`, capped at the market max).
+          example: null
         symbol_settings:
           type: object
           description: Effective settings for every listed market, keyed by symbol
@@ -1208,7 +1338,83 @@ components:
           description: Only with `scope=all`
           items:
             $ref: '#/components/schemas/AggregateAccountRef'
+    AcquireGuardsRequest:
+      type: object
+      required:
+      - count
+      properties:
+        count:
+          type: integer
+          minimum: 1
+          maximum: 128
+          example: 3
+    AcquireGuardsResponse:
+      type: object
+      properties:
+        account_id:
+          type: string
+          description: The authenticated account the guards belong to
+        guard_ids:
+          type: array
+          items:
+            type: string
+            format: uuid
+          example:
+          - 019a1340-0000-7000-8000-000000000001
+        idle_ttl_seconds:
+          type: integer
+          example: 3600
+    DeleteGuardsRequest:
+      type: object
+      required:
+      - ids
+      properties:
+        ids:
+          type: array
+          minItems: 1
+          maxItems: 128
+          items:
+            type: string
+            format: uuid
+    DeleteGuardsResponse:
+      type: object
+      properties:
+        deleted:
+          type: integer
+          description: Number of live guards removed
+          example: 1
+    EngineStatus:
+      type: object
+      properties:
+        timestamp:
+          type: integer
+          format: int64
+          description: Redis sample time (ms); cache hits keep the original sample time
+          example: 1794000000000
+        head_sequence_id:
+          type: integer
+          format: int64
+          description: Newest sequence published to the engine command stream
+          example: 12348
+        commit_sequence_id:
+          type: integer
+          format: int64
+          description: Last command the engine processed and committed. `commit_sequence_id >= sequence_id` of an acknowledged command means it was processed (not that it was placed or filled).
+          example: 12345
   responses:
+    GuardConflict:
+      description: Request guard refused; nothing was published
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          examples:
+            missing:
+              value:
+                error: guard is missing, expired or evicted for this account
+            stale:
+              value:
+                error: guard counter must be greater than the last admitted counter
     BadRequest:
       description: Invalid request (binding error, validation failure, or `vault_id` + `sub_account_id` both set)
       content:
@@ -1228,6 +1434,21 @@ components:
             exclusive:
               value:
                 error: vault_id and sub_account_id are mutually exclusive
+            fok_retired:
+              value:
+                error: Value "FOK" does not represent a OrderTimeInForce
+            post_only_ioc:
+              value:
+                error: post_only requires GTC or ALO time_in_force
+            alo_type:
+              value:
+                error: ALO requires limit, stop_limit, or take_profit_limit order type
+            amount_range:
+              value:
+                error: order_amount_out_of_range
+            nested_guard:
+              value:
+                error: guard must be on the batch request
     Unauthorized:
       description: Missing or invalid authentication
       content:
@@ -1274,6 +1495,11 @@ components:
             sub_account:
               value:
                 error: sub-account access denied
+            ip_allowlist:
+              summary: API key source-IP allowlist (adds `client_ip`)
+              value:
+                error: request IP is not allowed for this API key
+                client_ip: 203.0.113.7
     NotFound:
       description: Account, vault or order not found
       content:
@@ -1325,16 +1551,17 @@ paths:
         (`conditional_order_triggers_immediately`). `working_type` defaults to `mark_price` for
         stop/take-profit types and `contract_price` for trailing stops.
 
-        Time in force: `GTC` (default) rests; `IOC` expires the unfilled remainder; `FOK` expires
-        the whole order if it cannot fill completely. Market orders never rest.
+        Time in force: `GTC` (default) rests; `IOC` expires the unfilled remainder; `ALO` (or
+        `post_only: true`) rests only as a maker and is rejected (`order_would_match_immediately`)
+        if it would cross. `FOK` is retired (`400`). Market orders never rest.
 
-        Self-trade prevention is automatic (expire-maker): a taker never fills against a resting
-        order of the same account, the same master account family, or the same server-assigned
-        STP group; the resting order is expired with `CloseReason: order_expired_in_match`.
+        Self-trade prevention is always on; `stp_mode` picks what expires when this order meets a
+        resting order of the same account, root account or STP group (see `STPMode`).
 
-        Synchronous `400`s cover only body/ID/vault checks and a missing `stop_price` on
-        stop/take-profit types (`invalid_stop_price`). All market-rule, margin and position checks
-        happen in the engine; see the reason codes in the `strike-trading` skill.
+        Synchronous `400`s cover body/ID/vault checks, a missing `stop_price` on stop/take-profit
+        types (`invalid_stop_price`), amounts >= 1e12 (`order_amount_out_of_range`) and the
+        ALO / `post_only` / `stp_mode` combination rules. All market-rule, margin and position
+        checks happen in the engine; see the reason codes in the `strike-trading` skill.
       parameters:
       - $ref: '#/components/parameters/BuilderFeeBps'
       requestBody:
@@ -1353,7 +1580,29 @@ paths:
                   type: limit
                   size: '0.1'
                   price: '50000'
-                  post_only: true
+                  time_in_force: ALO
+              ioc_expire_taker:
+                summary: IOC that expires itself instead of your resting orders on a self-match
+                value:
+                  symbol: BTC-USD
+                  side: buy
+                  type: limit
+                  size: '0.1'
+                  price: '50100'
+                  time_in_force: IOC
+                  stp_mode: expire_taker
+              guarded:
+                summary: Guarded create (counter must exceed the guard's last admitted counter)
+                value:
+                  symbol: BTC-USD
+                  side: sell
+                  type: limit
+                  size: '0.1'
+                  price: '50500'
+                  time_in_force: ALO
+                  guard:
+                    id: 019a1340-0000-7000-8000-000000000001
+                    counter: 42
               market_with_slippage:
                 summary: Market sell, 1% max slippage
                 value:
@@ -1396,6 +1645,8 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/GuardConflict'
         '429':
           $ref: '#/components/responses/RateLimited'
         '500':
@@ -1456,6 +1707,118 @@ paths:
                 $ref: '#/components/schemas/Error'
         '404':
           description: '`order not found`, `account not found`, `user not found`'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /v2/_guards:
+    post:
+      tags:
+      - Guards
+      summary: Acquire request guards
+      description: |
+        Optional. Creates `count` fresh guards (counter 0) bound to the authenticated account - no
+        `vault_id` / `sub_account_id`; one guard covers commands for that account, its sub-accounts
+        and the vaults it leads. Use a guard as the top-level `guard` of `POST /v2/order`,
+        `/v2/orders/batch`, `/v2/orders/replace`, `/v2/order/replace`, `/v2/order/replace-batch`,
+        `/v2/order/strategy`, `DELETE /v2/order/cancel` or `/v2/order/cancel-all`; the API then
+        refuses (`409`) any request whose `counter` is not greater than the highest counter
+        already admitted on that guard. Useful when several senders trade one account; it is not
+        idempotency or a lock. Each admitted request renews the guard's 1-hour idle TTL. At most
+        128 active guards per account: acquiring more evicts the oldest-acquired. Expiry and
+        eviction never cancel orders. An admitted counter can stay consumed even if the publish
+        then fails. Margin, leverage and TWAP routes take no guard.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AcquireGuardsRequest'
+            example:
+              count: 3
+      responses:
+        '200':
+          description: Guards created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AcquireGuardsResponse'
+        '400':
+          description: Binding error (`count` missing or outside 1-128)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: '`account not found`'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    delete:
+      tags:
+      - Guards
+      summary: Delete request guards
+      description: Removes guards of the authenticated account; later use of them is a `409`. Unknown, expired and foreign IDs are no-ops. Does not cancel orders or undo published commands. **The JSON body is required on this DELETE.**
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeleteGuardsRequest'
+            example:
+              ids:
+              - 019a1340-0000-7000-8000-000000000001
+      responses:
+        '200':
+          description: Deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeleteGuardsResponse'
+        '400':
+          description: Binding error (`ids` missing, empty, more than 128, or not UUIDs)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /v2/_status:
+    get:
+      tags:
+      - Status
+      summary: Engine progress
+      description: |
+        Public. Head and committed sequence of the engine command stream that every write on this
+        API publishes to. For an acknowledged write, `commit_sequence_id >= sequence_id` means the
+        engine has processed it (it does not mean the order was placed or filled); read the order
+        or account after that. The snapshot is cached for 50 ms per API process; `refresh=true`
+        (or `1`) bypasses the cache. Responses carry `Cache-Control: no-store`.
+      security: []
+      parameters:
+      - name: refresh
+        in: query
+        required: false
+        schema:
+          type: boolean
+      responses:
+        '200':
+          description: Snapshot
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EngineStatus'
+        '400':
+          description: '`refresh must be a boolean (true/false or 1/0)`'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: '`status unavailable`'
           content:
             application/json:
               schema:
@@ -1566,6 +1929,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '409':
+          $ref: '#/components/responses/GuardConflict'
   /v2/order/cancel-all:
     delete:
       tags:
@@ -1595,6 +1960,8 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/GuardConflict'
   /v2/orders/batch:
     post:
       tags:
@@ -1604,10 +1971,11 @@ paths:
         Places each order independently, in order, as separate engine commands (no atomicity, may
         span symbols). Returns `200` once the request-level checks pass; per-order API-side
         failures are then listed in `failed` with their index. Request-level failures reject the
-        whole batch: binding errors, a reserved `client_order_id` prefix in any item, builder-fee
-        errors, `vault_id` + `sub_account_id`, sub-account ownership (`403`). Items are not
-        field-validated at bind time, and items hitting a silently-dropped engine reject (see the
-        top of this spec) appear in `successful`. No item cap beyond the 8 MiB body limit.
+        whole batch: binding errors, a reserved prefix or over-long `client_order_id` in any item,
+        a `guard` inside an item, builder-fee errors, `vault_id` + `sub_account_id`, sub-account
+        ownership (`403`), guard refusal (`409`, nothing appended). Items are not field-validated
+        at bind time, and items hitting a silently-dropped engine reject (see the top of this spec)
+        appear in `successful`. No item cap beyond the 8 MiB body limit.
       parameters:
       - $ref: '#/components/parameters/BuilderFeeBps'
       requestBody:
@@ -1623,13 +1991,13 @@ paths:
                 type: limit
                 size: '0.1'
                 price: '49000'
-                post_only: true
+                time_in_force: ALO
               - symbol: ETH-USD
                 side: sell
                 type: limit
                 size: '1'
                 price: '3600'
-                post_only: true
+                time_in_force: ALO
       responses:
         '200':
           description: Batch processed
@@ -1654,6 +2022,8 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/GuardConflict'
   /v2/orders/replace:
     post:
       tags:
@@ -1668,9 +2038,10 @@ paths:
         rules (size/step, tick, price range/bound, min notional, `invalid_stop_price`) the whole
         command is dropped - nothing is canceled, the failing order is published as `rejected`,
         the rest are never created. Otherwise cancels apply first, then creates run in order; the
-        first create rejected for any other reason (margin, post-only cross, ...) stops the batch
-        and later creates are skipped without order events. A create rejected with
-        `conditional_order_triggers_immediately` does not stop the batch.
+        first create rejected for any other reason (margin, reduce-only, `circuit_breaker`,
+        `order_not_allowed`, ...) stops the batch and later creates are skipped without order
+        events. A create rejected with `conditional_order_triggers_immediately` or an ALO cross
+        (`order_would_match_immediately`) does not stop the batch.
         Limit: 1000 operations (cancel-all counts as one). Duplicate `client_order_id`s in one
         request: `400 duplicate_request_id`. Items in `orders` are not field-validated at bind
         time; an item with missing `side`/`type`, or an unknown `symbol`, drops the whole command
@@ -1691,13 +2062,16 @@ paths:
                 type: limit
                 size: '0.2'
                 price: '49990'
-                post_only: true
+                time_in_force: ALO
               - client_order_id: ask-1
                 side: sell
                 type: limit
                 size: '0.2'
                 price: '50010'
-                post_only: true
+                time_in_force: ALO
+              guard:
+                id: 019a1340-0000-7000-8000-000000000001
+                counter: 43
       responses:
         '200':
           description: Command sequenced
@@ -1706,7 +2080,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ReplaceSymbolOrdersResponse'
         '400':
-          description: 'Binding errors, `duplicate_request_id`, `slippage_only_for_market_orders`, `slippage_must_be_positive`, `invalid_stop_price`, `batch_replace_orders: total operations exceed 1000`'
+          description: 'Binding errors, `duplicate_request_id`, `slippage_only_for_market_orders`, `slippage_must_be_positive`, `invalid_stop_price`, `order_amount_out_of_range`, the ALO / `post_only` rules, `guard must be on the symbol replacement request`, `batch_replace_orders: total operations exceed 1000`'
           content:
             application/json:
               schema:
@@ -1717,6 +2091,8 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/GuardConflict'
   /v2/order/replace:
     post:
       tags:
@@ -1744,7 +2120,7 @@ paths:
                 type: limit
                 size: '0.1'
                 price: '49500'
-                post_only: true
+                time_in_force: ALO
       responses:
         '200':
           description: Command sequenced
@@ -1764,7 +2140,7 @@ paths:
                 sequence_id: 70804202
                 message_id: 1775914565500-0
         '400':
-          description: '`replacement at index 0 must include cancel or new_order`, `order_id_not_set`, `mismatched_order_symbol`, `invalid_symbol`, `new_order vault_id mismatch at index 0`, binding errors'
+          description: '`replacement at index 0 must include cancel or new_order`, `order_id_not_set`, `mismatched_order_symbol`, `invalid_symbol`, `new_order vault_id mismatch at index 0`, the ALO / `post_only` rules, `order_amount_out_of_range`, `guard must be on the replacement request, not its order legs`, binding errors'
           content:
             application/json:
               schema:
@@ -1775,6 +2151,8 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/GuardConflict'
   /v2/order/replace-batch:
     post:
       tags:
@@ -1787,8 +2165,8 @@ paths:
 
         Engine semantics: if any create fails static market rules, nothing is applied (no cancels)
         and that create is published as `rejected`. Otherwise all cancels apply, then creates run
-        in order until the first rejection (other than
-        `conditional_order_triggers_immediately`); remaining creates are skipped with no order
+        in order until the first rejection other than `conditional_order_triggers_immediately` or
+        an ALO cross (`order_would_match_immediately`); remaining creates are skipped with no order
         event. Limit: 1000 operations per request. A create with missing `side`/`type`, or an
         unknown symbol, drops the whole command silently (no cancels, no events).
       parameters:
@@ -1810,7 +2188,7 @@ paths:
                   type: limit
                   size: '0.1'
                   price: '49500'
-                  post_only: true
+                  time_in_force: ALO
               - cancel:
                   order_id: 33428501
                   symbol: BTC-USD
@@ -1820,7 +2198,7 @@ paths:
                   type: limit
                   size: '0.1'
                   price: '50500'
-                  post_only: true
+                  time_in_force: ALO
       responses:
         '200':
           description: Command sequenced
@@ -1829,7 +2207,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ReplaceBatchOrdersResponse'
         '400':
-          description: 'Per-item build failures carry `failed_index` (`replacement at index i must include cancel or new_order`, `vault_id mismatch at index i`, `cancel vault_id mismatch at index i`, `new_order vault_id mismatch at index i`, `order_id_not_set`, `invalid_symbol`, `mismatched_order_symbol`). Command-level failures (`duplicate_request_id`, `batch_replace_orders: total operations exceed 1000`, slippage errors, `invalid_stop_price`) and binding errors return only `error`.'
+          description: 'Per-item build failures carry `failed_index` (`replacement at index i must include cancel or new_order`, `vault_id mismatch at index i`, `cancel vault_id mismatch at index i`, `new_order vault_id mismatch at index i`, `order_id_not_set`, `invalid_symbol`, `mismatched_order_symbol`, `post_only requires GTC or ALO time_in_force`). Command-level failures (`duplicate_request_id`, `batch_replace_orders: total operations exceed 1000`, slippage errors, `invalid_stop_price`, `order_amount_out_of_range`, the ALO order-type / `stp_mode` rules), `guard must be on the batch replacement request` and binding errors return only `error`.'
           content:
             application/json:
               schema:
@@ -1842,6 +2220,8 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/GuardConflict'
   /v2/order/strategy:
     post:
       tags:
@@ -1859,8 +2239,13 @@ paths:
         sell primary. A leg with `stop_price` missing or <= 0 fails earlier with
         `400 invalid_stop_price`. `callback_rate`, `activation_price` and `slippage` are not part
         of this body and are ignored if sent, so trailing stops and market slippage are not
-        available on the primary. Vault errors here read `only vault leader can perform this
-        action on vault account` / `vault is <status>`.
+        available on the primary. The ALO / `post_only` and `stp_mode` rules apply to the primary
+        and each leg separately (legs do not inherit the primary's `stp_mode`). Vault errors here
+        read `only vault leader can perform this action on vault account` / `vault is <status>`.
+
+        If a leg breaks the market's order rules (price range, tick, min size, ...) the engine
+        rejects the whole strategy: the primary is published `rejected` with that leg's reason
+        code as `CloseReason`; the legs get no event.
       parameters:
       - $ref: '#/components/parameters/BuilderFeeBps'
       requestBody:
@@ -1892,7 +2277,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/CreateStrategyOrderResponse'
         '400':
-          description: '`at least one of tp_order or sl_order must be provided`, `invalid_secondary_order`, `invalid_stop_price`, binding errors'
+          description: '`at least one of tp_order or sl_order must be provided`, `invalid_secondary_order`, `invalid_stop_price`, `invalid_strategy_id` (over 254 bytes), `order_amount_out_of_range`, the ALO / `post_only` rules, `guard must be on the strategy request, not its order legs`, binding errors'
           content:
             application/json:
               schema:
@@ -1903,6 +2288,8 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/GuardConflict'
     get:
       tags:
       - Strategy

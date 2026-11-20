@@ -1,6 +1,6 @@
 ---
 name: strike-orderbook
-description: Strike Finance orderbook integration — REST depth snapshots, top-20 WebSocket depth diffs, bookticker, local book sync, VWAP estimation, and the public L3 market-by-order feed (snapshot + sequenced order events). Use when building orderbook displays, market-making bots or calculating fill prices.
+description: Strike Finance orderbook integration — REST depth snapshots, full-depth WebSocket diffs chained by pu, bookticker, local book sync, VWAP estimation, and the public L3 market-by-order feed (snapshot + sequenced order events). Use when building orderbook displays, market-making bots or calculating fill prices.
 ---
 
 # Strike Finance Orderbook
@@ -9,25 +9,26 @@ Two public, unauthenticated order-book products:
 
 | Product | REST | WebSocket | Use for |
 |---------|------|-----------|---------|
-| L2 (price levels) | `GET https://<host>/price/v2/depth` | `wss://<host>/ws/price`, stream `<symbol>@depth` (top 20) and `<symbol>@bookticker` | UIs, top-of-book, VWAP |
+| L2 (price levels) | `GET https://<host>/price/v2/depth` | `wss://<host>/ws/price`, stream `<symbol>@depth` (full book) and `<symbol>@bookticker` | UIs, top-of-book, VWAP |
 | L3 (individual orders, FIFO) | `GET https://<host>/v2/l3/snapshot` | `wss://<host>/ws/l3`, stream `<symbol>@l3` | Exact book reconstruction, queue position |
 
 `<host>` = `api.strikefinance.org` (mainnet) or `api-v2-testnet.strikefinance.org` (testnet).
 
 ## REST Depth Snapshot
 
-**GET** `https://api.strikefinance.org/price/v2/depth?symbol=BTC-USD&limit=20`
+**GET** `https://api.strikefinance.org/price/v2/depth?symbol=BTC-USD`
 
-- `symbol` (required, case-sensitive, e.g. `BTC-USD`); `limit` levels per side, default 20, max 1000.
-- Read live from the engine snapshot on every request (not cached).
-- Unknown symbol → `200` with `lastUpdateId: 0` and empty arrays. Missing symbol → `400 {"code":"MISSING_PARAMETER",...}`.
+- `symbol` (required, case-sensitive, e.g. `BTC-USD`); `limit` levels per side, default **1000**, up to 65534 (larger values are clamped; missing, non-numeric or <= 0 → 1000).
+- Returns the full book the `<symbol>@depth` stream **last published**, so `lastUpdateId` is exactly the `u` of that `depthUpdate` and the next one has `pu == lastUpdateId`. Not cached.
+- Unknown symbol, or no book published for it yet → `200` with `lastUpdateId: 0` and empty arrays. Missing symbol → `400 {"code":"MISSING_PARAMETER",...}`.
+- A side that returns fewer than `limit` levels is complete. If a side hits `limit`, your copy lacks the deeper levels until they change, so request a `limit` above the depth you care about.
 
 ```typescript
 interface DepthSnapshot {
-  lastUpdateId: number; // uint64 order-book update ID (same domain as WS U/u)
+  lastUpdateId: number; // u of the last published depthUpdate (uint64)
   E: number;            // server response time (ms)
-  T: number;            // time the engine produced the snapshot (ms)
-  bids: [string, string][]; // [price, quantity], highest first
+  T: number;            // matching-engine time of this book (ms); response time when nothing has been published
+  bids: [string, string][]; // [price, quantity], highest first; never a zero size
   asks: [string, string][]; // [price, quantity], lowest first
 }
 ```
@@ -50,40 +51,38 @@ interface DepthUpdateEvent {
   s: string;              // "BTC-USD"
   U: number;              // first order-book update ID coalesced into this message
   u: number;              // final order-book update ID
+  pu: number;             // u of the previous depthUpdate for this symbol (0 on the very first one)
   b: [string, string][] | null; // changed bid levels [price, qty]; null when no bid level changed
   a: [string, string][] | null; // changed ask levels [price, qty]; null when no ask level changed
 }
 ```
 
-How the stream is produced (this drives the sync rules):
+How the stream is produced:
 
-- It covers only the **top 20 levels per side**. Each message lists levels whose size changed since the previous message on the channel, with their **absolute** new size.
-- `qty = "0"` means the level is no longer in the top 20 — it was removed **or** pushed below level 20.
-- Updates are coalesced and flushed every 100 ms, and sent only when the top 20 changed.
-- `U`/`u` are **not contiguous** between messages; a gap is not a missed update.
-- Each message is a diff against the **previous message published on the channel** (the server's last published top 20), **not against your REST snapshot**. A level that differed between your snapshot and that server state, and is not touched again, stays wrong until you re-sync.
+- It covers the **whole book** (every level). Each message lists the levels whose size changed since the previous message for that symbol, with their **absolute** new size; `qty = "0"` means the price level is gone.
+- Updates are coalesced and flushed every 100 ms, and sent only when the book changed.
+- **Continuity:** each message's `pu` equals the previous message's `u`, and the REST snapshot's `lastUpdateId` is the `u` of the last message. A `pu` that does not match the last `u` you applied means a message was missed. `U` need not equal `pu + 1` (engine IDs are coalesced), so only check `pu`.
+- The published book and its `u` survive service restarts, so the chain continues across them.
 - `b` or `a` is JSON `null` (not `[]`) when that side has no changes; always read them as `ev.b ?? []`.
 - There is no snapshot on subscribe — use the REST endpoint.
-- When a symbol gets its **first** depth subscriber on the server (no depth subscribers before, or after a service restart), the next message is the **full current top 20 with no `"0"` removals**, sent to whoever is subscribed at that moment. Nothing in the payload marks it, and you cannot know whether you were first. Applied on top of a REST seed, any seed level that is no longer in the book survives, so re-seed after it (step 3 below).
-- A client that falls behind (1024 queued messages) silently loses messages while staying connected; IDs cannot reveal this, so re-sync periodically.
+- A client that falls 1024 queued messages behind is **disconnected** (the socket is dropped without a close frame), never left open with a hole in the stream. Reconnect and re-sync.
 - One frame may contain several `\n`-separated JSON messages.
 
 ## Synchronization Pattern (Critical)
 
 1. **Subscribe** to `<symbol>@depth`, **buffer** incoming events, and wait for the ack `{"id":1,"result":null}` (the subscription is registered just before the ack is sent).
-2. **Fetch** `GET /price/v2/depth?symbol=...&limit=20` and record `lastUpdateId`.
-3. **Drop** buffered events with `u <= lastUpdateId`; apply the rest in order. When the **first** `depthUpdate` after a (re)subscribe arrives, re-seed once more from REST (keep that event in the buffer) — it may be a full top-20 push without removals.
-4. For each live event: skip if `u <= lastAppliedU`, otherwise apply it and set `lastAppliedU = u`.
-5. **Apply:** for each `[price, qty]` in `ev.b ?? []` / `ev.a ?? []` — `qty === "0"` → delete; else `set(price, qty)`. Then keep only the best 20 levels per side (deeper levels are never updated by the stream).
-6. **Re-sync** (back to step 2) after every reconnect, if the book crosses (best bid >= best ask), and periodically (e.g. every 60 s). Periodic re-sync is required for **correctness**, not only to recover dropped messages, because diffs are relative to the server's previous message rather than your snapshot.
+2. **Fetch** `GET /price/v2/depth?symbol=...` and record `lastUpdateId`.
+3. **Drop** buffered events with `u <= lastUpdateId`. The first remaining event must have `pu == lastUpdateId`, and every later one `pu ==` the previous event's `u`.
+4. **Apply:** for each `[price, qty]` in `ev.b ?? []` / `ev.a ?? []` — `qty === "0"` → delete; else `set(price, qty)`.
+5. **Re-sync** (back to step 2, keep buffering) on any `pu` mismatch, and after every reconnect. No periodic re-sync is needed.
 
 For a top-of-book view only, subscribe to `<symbol>@bookticker` instead: every message is a complete best bid/ask (no sync needed) and only the newest pending message is kept for slow clients.
 
 ```json
-{"e":"bookTicker","E":1792438776570,"s":"BTC-USD","u":93450741,"b":"82.55","B":"1.82","a":"82.67","A":"39.31"}
+{"e":"bookTicker","E":1792438776570,"T":1792438776512,"s":"BTC-USD","u":93450741,"b":"82.55","B":"1.82","a":"82.67","A":"39.31"}
 ```
 
-`b`/`B` = best bid price/size, `a`/`A` = best ask price/size (`""` when that side is empty), `u` = order-book update ID.
+`b`/`B` = best bid price/size, `a`/`A` = best ask price/size (`""` when that side is empty), `u` = order-book update ID, `E` = publication time, `T` = matching-engine book time.
 
 ## VWAP Fill Estimation
 
@@ -107,25 +106,23 @@ function estimateMarketFillPrice(
 }
 ```
 
-Returns `null` when the visible book cannot fill the size. The WS book only has 20 levels per side; for larger sizes fetch `/price/v2/depth` with a higher `limit`.
+Returns `null` when the visible book cannot fill the size.
 
 ## Full Implementation Example
 
 ```typescript
 type PriceLevel = [string, string];
-const DEPTH = 20;
 const BASE = "https://api.strikefinance.org/price/v2";
+const SNAPSHOT_LIMIT = 5000; // levels per side; a side that returns fewer is the complete side
 
 class OrderBookManager {
   private bids = new Map<string, string>();
   private asks = new Map<string, string>();
-  private lastAppliedU = 0;
+  private lastU = 0; // u of the last applied update (or the snapshot's lastUpdateId)
   private synced = false;
-  private awaitingFirstDiff = false; // first depthUpdate after subscribe may be a full top-20 push
   private generation = 0; // bumped by every resync; stale snapshot fetches are discarded
   private buffer: DepthUpdateEvent[] = [];
   private ws: WebSocket | null = null;
-  private resyncTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(private symbol: string, private onUpdate: () => void) {}
 
@@ -138,36 +135,34 @@ class OrderBookManager {
       for (const line of String(ev.data).split("\n")) {
         if (!line) continue;
         const msg = JSON.parse(line);
-        if (msg.id === 1 && "result" in msg) {
-          this.awaitingFirstDiff = true;
-          void this.resync(); // subscribed: now take the snapshot
-        }
+        if (msg.id === 1 && "result" in msg) void this.resync(); // subscribed: now take the snapshot
         else if (msg.e === "depthUpdate" && msg.s === this.symbol) this.onDepth(msg);
       }
     };
     this.ws.onclose = () => {
+      // Also fires when the server drops a slow consumer.
       this.synced = false;
       this.generation++;
       setTimeout(() => this.start(), 1000); // reconnect; the new ack triggers a resync
     };
-    this.resyncTimer ??= setInterval(() => { if (this.synced) void this.resync(); }, 60_000);
   }
 
-  private async resync(keep?: DepthUpdateEvent): Promise<void> {
+  private async resync(): Promise<void> {
     const gen = ++this.generation;
     this.synced = false;
-    this.buffer = keep ? [keep] : [];
+    this.buffer = [];
     try {
-      const res = await fetch(`${BASE}/depth?symbol=${encodeURIComponent(this.symbol)}&limit=${DEPTH}`);
+      const res = await fetch(`${BASE}/depth?symbol=${encodeURIComponent(this.symbol)}&limit=${SNAPSHOT_LIMIT}`);
       if (!res.ok) throw new Error(`depth HTTP ${res.status}`);
       const snap: DepthSnapshot = await res.json();
       if (gen !== this.generation) return; // a newer resync (or reconnect) superseded this one
       this.bids = new Map(snap.bids);
       this.asks = new Map(snap.asks);
-      this.lastAppliedU = snap.lastUpdateId;
-      for (const ev of this.buffer) if (ev.u > this.lastAppliedU) this.apply(ev);
+      this.lastU = snap.lastUpdateId;
+      const pending = this.buffer.filter((ev) => ev.u > this.lastU);
       this.buffer = [];
       this.synced = true;
+      for (const ev of pending) if (!this.apply(ev)) return void this.resync();
       this.onUpdate();
     } catch {
       if (gen === this.generation) setTimeout(() => void this.resync(), 1000); // retry, never stay unsynced
@@ -175,49 +170,39 @@ class OrderBookManager {
   }
 
   private onDepth(ev: DepthUpdateEvent): void {
-    if (this.awaitingFirstDiff) {
-      // Possibly a full top-20 push with no "0" removals: re-seed from REST, keeping this event.
-      this.awaitingFirstDiff = false;
-      void this.resync(ev);
-      return;
-    }
     if (!this.synced) {
       this.buffer.push(ev);
       return;
     }
-    if (ev.u <= this.lastAppliedU) return;
-    this.apply(ev);
-    if (this.crossed()) void this.resync();
-    else this.onUpdate();
+    if (ev.u <= this.lastU) return; // already contained in the snapshot
+    if (!this.apply(ev)) return void this.resync(); // pu gap: a message was missed
+    this.onUpdate();
   }
 
-  private apply(ev: DepthUpdateEvent): void {
+  /** Applies ev if it continues the pu chain; returns false on a gap. */
+  private apply(ev: DepthUpdateEvent): boolean {
+    if (ev.pu !== this.lastU) return false;
     for (const [p, q] of ev.b ?? []) q === "0" ? this.bids.delete(p) : this.bids.set(p, q);
     for (const [p, q] of ev.a ?? []) q === "0" ? this.asks.delete(p) : this.asks.set(p, q);
-    this.bids = new Map(this.getSortedBids());
-    this.asks = new Map(this.getSortedAsks());
-    this.lastAppliedU = ev.u;
+    this.lastU = ev.u;
+    return true;
   }
 
-  private crossed(): boolean {
-    const bb = this.getSortedBids()[0], ba = this.getSortedAsks()[0];
-    return !!bb && !!ba && parseFloat(bb[0]) >= parseFloat(ba[0]);
+  getSortedBids(depth = 20): PriceLevel[] {
+    return [...this.bids.entries()].sort((a, b) => parseFloat(b[0]) - parseFloat(a[0])).slice(0, depth);
   }
 
-  getSortedBids(): PriceLevel[] {
-    return [...this.bids.entries()].sort((a, b) => parseFloat(b[0]) - parseFloat(a[0])).slice(0, DEPTH);
-  }
-
-  getSortedAsks(): PriceLevel[] {
-    return [...this.asks.entries()].sort((a, b) => parseFloat(a[0]) - parseFloat(b[0])).slice(0, DEPTH);
+  getSortedAsks(depth = 20): PriceLevel[] {
+    return [...this.asks.entries()].sort((a, b) => parseFloat(a[0]) - parseFloat(b[0])).slice(0, depth);
   }
 
   estimateFillPrice(side: "Long" | "Short", size: number): number | null {
-    return estimateMarketFillPrice({ bids: this.getSortedBids(), asks: this.getSortedAsks() }, side, size);
+    return estimateMarketFillPrice(
+      { bids: this.getSortedBids(Infinity), asks: this.getSortedAsks(Infinity) }, side, size
+    );
   }
 
   destroy(): void {
-    if (this.resyncTimer) clearInterval(this.resyncTimer);
     if (this.ws) {
       this.ws.onclose = null;
       this.ws.close();
@@ -228,7 +213,7 @@ class OrderBookManager {
 
 // Usage
 const book = new OrderBookManager("BTC-USD", () => {
-  console.log("best bid", book.getSortedBids()[0], "best ask", book.getSortedAsks()[0]);
+  console.log("best bid", book.getSortedBids(1)[0], "best ask", book.getSortedAsks(1)[0]);
 });
 book.start();
 ```
@@ -244,11 +229,11 @@ Every visible resting order, in exact price/FIFO priority, plus a lossless per-s
 | Snapshot | `https://api.strikefinance.org/v2/l3/snapshot?symbol=BTC-USD` | `https://api-v2-testnet.strikefinance.org/v2/l3/snapshot?symbol=BTC-USD` |
 | WebSocket | `wss://api.strikefinance.org/ws/l3` | `wss://api-v2-testnet.strikefinance.org/ws/l3` |
 
-Only allowlisted symbols are served (currently `BTC-USD`).
+Every market the engine publishes is served (a new market joins when it is created, starting at sequence 0); take symbols from `GET /v2/markets` rather than a fixed list. Any other symbol gets `400 unsupported or missing symbol` (REST) or `unsupported L3 channel` (WS).
 
 ### Snapshot
 
-`symbol` is trimmed and upper-cased. The book is complete (never truncated or paginated); bids descending, asks ascending, orders within a level in FIFO priority.
+`symbol` is trimmed and upper-cased. The book is complete (never truncated or paginated); bids descending, asks ascending, orders within a level in FIFO priority. Prices and sizes, here and in updates, are canonical decimal strings without trailing zeros (`"72247.3"`, not `"72247.30"`).
 
 ```json
 {
@@ -257,8 +242,8 @@ Only allowlisted symbols are served (currently `BTC-USD`).
   "last_sequence": 11197,
   "timestamp": 1792438895126,
   "bids": [
-    {"price": "72247.30", "orders": [{"order_id": "9Ix5zep5IpZafACmP1p_3Q", "size": "0.01107"}]},
-    {"price": "72178.80", "orders": [{"order_id": "OKIEOZ727YYzn5Cy8JOxGA", "size": "0.01108"}]}
+    {"price": "72247.3", "orders": [{"order_id": "9Ix5zep5IpZafACmP1p_3Q", "size": "0.01107"}]},
+    {"price": "72178.8", "orders": [{"order_id": "OKIEOZ727YYzn5Cy8JOxGA", "size": "0.01108"}]}
   ],
   "asks": []
 }
@@ -296,11 +281,12 @@ Update event:
   "order_id": "9Ix5zep5IpZafACmP1p_3Q",
   "taker_order_id": "Qm3x0bJr2dW8cT1uVf5yHg",
   "side": "buy",
-  "price": "72247.30",
+  "price": "72247.3",
   "delta_size": "-0.004",
   "remaining_size": "0.00707",
   "sequence": 11198,
   "trade_id": 18072,
+  "order_type": "fill",
   "timestamp": 1792438901234
 }
 ```
@@ -308,16 +294,16 @@ Update event:
 | `action` | Fields present | Effect on local book |
 |----------|----------------|----------------------|
 | `open` | `order_id`, `side`, `price`, `delta_size` (= `remaining_size`, > 0) | Append order at the **tail** of its price level |
-| `modify` | same, `delta_size` < 0, `remaining_size` > 0 | Reduce in place, keep queue position (reserved; no engine operation emits it today) |
 | `cancel` | same, `delta_size` < 0, `remaining_size` `"0"` | Remove order (no trade) |
-| `partial_fill` | + `trade_id`, `taker_order_id`; `remaining_size` > 0 | Set order size to `remaining_size` |
-| `full_fill` | + `trade_id`, `taker_order_id`; `remaining_size` `"0"` | Remove order |
+| `partial_fill` | + `trade_id`, `taker_order_id`, `order_type`; `remaining_size` > 0 | Set order size to `remaining_size` (keeps queue position) |
+| `full_fill` | + `trade_id`, `taker_order_id`, `order_type`; `remaining_size` `"0"` | Remove order |
 | `clear` | only `type`, `symbol`, `action`, `sequence`, `timestamp` | Discard the local book and re-bootstrap from a snapshot |
 
 - `side` is `"buy"` or `"sell"`; `order_id` is an opaque 22-character base64url ID, stable for the order's lifetime (a cancel-and-replace gets a new ID). `taker_order_id` matches the later `open` `order_id` if the taker's remainder rests.
 - `trade_id` is the public trade ID (same as `/price/v2/trades` `id` and WS `trade.t`).
+- `order_type` (fills only): `liquidation` when the taker was a position being liquidated, otherwise `fill`; it matches `order_type` on the public trade with the same `trade_id`. ADL settles off the book, so it never appears in L3.
 - `timestamp` is the engine mutation time (ms).
-- Every update, including `clear`, advances the symbol's `sequence` by exactly 1. The engine emits `clear` on every restart.
+- Every update, including `clear`, advances the symbol's `sequence` by exactly 1. The engine emits one `clear` per symbol on every restart. There is no `modify` action: a replace is a `cancel` plus an `open` with a new `order_id`.
 
 ### L3 bootstrap and recovery
 
@@ -326,14 +312,13 @@ Update event:
 3. Drop buffered updates with `sequence <= last`; apply the rest. Each must have `sequence === last + 1`.
 4. On a gap, a `clear`, or a socket close, throw the book away and repeat from step 1.
 
-Key price levels by a canonical price string: the same price can be spelled with different trailing zeros (`"72247.30"` vs `"72247.3"`), and a snapshot level shows the first order's spelling while each update carries its own order's spelling.
+Price strings are canonical in both the snapshot and updates, so they can key price levels directly.
 
 The server never drops an update to keep a socket alive: it **closes** the connection instead — `1013` (client too slow or connection lease lost) or `1012` (server-side sequence gap, stream or publisher unavailable). Reconnect and re-snapshot on any close.
 
 ```typescript
 type L3Order = { id: string; size: string };
-type L3Side = Map<string, L3Order[]>; // canonical price -> FIFO queue
-const px = (p: string) => (p.includes(".") ? p.replace(/0+$/, "").replace(/\.$/, "") : p);
+type L3Side = Map<string, L3Order[]>; // price (canonical string) -> FIFO queue
 
 function runL3(symbol = "BTC-USD", host = "api.strikefinance.org") {
   const bids: L3Side = new Map(), asks: L3Side = new Map();
@@ -348,7 +333,7 @@ function runL3(symbol = "BTC-USD", host = "api.strikefinance.org") {
     if (u.sequence !== last + 1 || u.action === "clear") return restart();
     last = u.sequence;
     const book = u.side === "buy" ? bids : asks;
-    const key = px(u.price);
+    const key = u.price;
     const queue = book.get(key) ?? [];
     if (u.action === "open") queue.push({ id: u.order_id, size: u.remaining_size });
     else {
@@ -366,7 +351,7 @@ function runL3(symbol = "BTC-USD", host = "api.strikefinance.org") {
     const snap = await res.json();
     if (dead) return;
     for (const [side, levels] of [[bids, snap.bids], [asks, snap.asks]] as const) {
-      for (const lvl of levels) side.set(px(lvl.price), lvl.orders.map((o: any) => ({ id: o.order_id, size: o.size })));
+      for (const lvl of levels) side.set(lvl.price, lvl.orders.map((o: any) => ({ id: o.order_id, size: o.size })));
     }
     last = snap.last_sequence;
     for (const u of buffered) if (u.sequence > last) apply(u);

@@ -1,13 +1,13 @@
 ---
 name: strike-grid-bot
-description: Strike Finance grid trading bots -- create (LONG / SHORT / NEUTRAL, LIMIT_ONLY or MARKET_SEEDED), stop (with or without canceling orders), list / get / order-history reads (public with redaction, scope=all), how the grid places entries, take-profits, stop-losses and re-grids, sizing and validation rules, status lifecycle, liquidation handling, grid client order IDs, and strategyUpdate grid events. Use when building or monitoring grid bots, or when a bot needs to recognize grid-managed orders on an account.
+description: Strike Finance grid trading bots -- create (LONG / SHORT / NEUTRAL, LIMIT_ONLY or MARKET_SEEDED), stop (with or without canceling orders), list / get / order-history reads (public with redaction, scope=all), grid profit and total PnL, how the grid places entries, take-profits, stop-losses and re-grids, sizing and validation rules, status lifecycle, liquidation handling, grid client order IDs, and strategyUpdate grid events. Use when building or monitoring grid bots, or when a bot needs to recognize grid-managed orders on an account.
 ---
 
 # Strike Finance Grid Bots
 
 Base URL: `https://api.strikefinance.org` (testnet `https://api-v2-testnet.strikefinance.org`). Paths are used as-is.
 
-A grid bot is server-side order automation on one symbol of one account: it rests post-only limit entries at evenly spaced prices, arms a take-profit (and optional stop-loss) when an entry fills, and re-places the entry when the take-profit fills. It trades the account's normal one-way position and margin — nothing is segregated.
+A grid bot is server-side order automation on one symbol of one account: it rests post-only (ALO) limit entries at evenly spaced prices, arms a take-profit (and optional stop-loss) when an entry fills, and re-places the entry when the take-profit fills. It trades the account's normal one-way position and margin — nothing is segregated.
 
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
@@ -35,21 +35,21 @@ Sign requests with **strike-auth** (`signRequest` / `authenticatedFetch`). There
 
 | Mode | `LIMIT_ONLY` (default) | Exit side |
 |---|---|---|
-| `LONG` | Post-only **buy** at every level strictly below the mark; levels at/above the mark are dropped for the bot's life | TP sell at `entry + spacing` |
-| `SHORT` | Post-only **sell** at every level strictly above the mark; levels at/below are dropped | TP buy at `entry − spacing` |
+| `LONG` | ALO **buy** at every level strictly below the mark; levels at/above the mark are dropped for the bot's life | TP sell at `entry + spacing` |
+| `SHORT` | ALO **sell** at every level strictly above the mark; levels at/below are dropped | TP buy at `entry − spacing` |
 | `NEUTRAL` | Buy below the mark, sell above, skip a level exactly at the mark | Buy levels TP at `+spacing`, sell levels at `−spacing` |
 
-`MARKET_SEEDED` (`LONG`/`SHORT` only) treats each level as an interval `[lower+i·s, lower+(i+1)·s]`. `LONG` enters at the interval bottom and exits at its top; every interval whose top is above the mark (including the one containing the mark) is opened immediately by **one market FOK order** for `seeded_intervals × size_per_grid`, and the rest get resting post-only buys. `SHORT` mirrors it (enter at top, exit at bottom, seed intervals whose bottom is below the mark). The seed VWAP becomes those levels' entry price.
+`MARKET_SEEDED` (`LONG`/`SHORT` only) treats each level as an interval `[lower+i·s, lower+(i+1)·s]`. `LONG` enters at the interval bottom and exits at its top; every interval whose top is above the mark (including the one containing the mark) is opened immediately by **one market IOC order** for `seeded_intervals × size_per_grid`, and the rest get resting ALO buys. `SHORT` mirrors it (enter at top, exit at bottom, seed intervals whose bottom is below the mark). The seed can fill partially: the filled size is allocated to seeded intervals in level order (lowest price first), each up to `size_per_grid`, and seeded intervals left without fill are dropped for good. The seed VWAP becomes those levels' entry price. A seed with no fill at all fails the create (see Lifecycle).
 
 Per-level orders (all GTC):
 
 | Order | Type | Notes |
 |---|---|---|
-| Entry | `limit`, post-only | Size `size_per_grid` |
-| Take-profit | `limit`, **not** post-only | Placed only after the entry is **fully** filled (partial entry fills arm nothing). Reduce-only for LONG/SHORT; plain (not reduce-only) for NEUTRAL |
+| Entry | `limit`, `time_in_force: ALO` (post-only) | Size `size_per_grid` |
+| Take-profit | `limit` GTC, **not** ALO (fills at once if price already passed it) | Placed only after the entry is **fully** filled (partial entry fills arm nothing). Reduce-only for LONG/SHORT; plain (not reduce-only) for NEUTRAL |
 | Stop-loss | `stop` (stop-market, mark-price trigger) at the bot's SL price | Only when an SL price was set; same reduce-only rule. If the engine refuses it as already triggered (`conditional_order_triggers_immediately`) or the triggered market leg is cut by slippage (`market_order_exceeded_slippage`), the grid closes the level with an IOC market order instead |
 
-- **Re-grid**: when a level's take-profit fully fills, a new post-only entry is placed at the same price/side/TP/SL (new strategy ID `…:regrid-<ns>`).
+- **Re-grid**: when a level's take-profit fully fills, a new ALO entry is placed at the same price/side/TP/SL (new strategy ID `…:regrid-<ns>`).
 - **Stop-loss fill** closes that level for good (no re-grid); the bot keeps running with its remaining levels. There is no bot-wide take-profit, stop or trigger price, and nothing closes the position when a bot stops.
 - **Partial exit fill**: each piece is recorded (history row + `GRID_BOT_FILL` with `partial: true`); the sibling exit is canceled and re-placed for the remainder; the level closes and re-grids only when the exit fully fills.
 - **Entry retries**: an unfilled level whose entry (initial or re-grid) is rejected `order_would_match_immediately`, or whose re-grid fails to publish, is kept and retried (1 s doubling to 30 s). While the mark is on the wrong side it waits (re-checks every 30 s) without using an attempt; after 10 failed attempts it gives up — the level stays without an entry, `last_error` is set and `GRID_BOT_FAILED` is sent.
@@ -67,9 +67,9 @@ Bot ID: `grid-<account_id>-<symbol>-<uuidv7>`. Grid orders are ordinary orders o
 |---|---|
 | `<bot_id>:grid-<i>:entry` / `:tp` / `:sl` | Initial level `i` |
 | `<bot_id>:regrid-<unix_ns>:entry` / `:tp` / `:sl` | Re-gridded level |
-| `<bot_id>:initial-seed:entry` | MARKET_SEEDED seed (market FOK) |
+| `<bot_id>:initial-seed:entry` | MARKET_SEEDED seed (market IOC) |
 
-`Strategy.ID` is the level's strategy ID (client ID without the suffix); entries have `IsPrimary: true`, exits `false`. Grid orders carry no `Builder`. Don't create your own orders with a `<bot_id>:` client ID prefix: a cancel-on-stop reconcile cancels every active order on that account+symbol with that prefix.
+`Strategy.ID` is the level's strategy ID (client ID without the suffix); entries have `IsPrimary: true`, exits `false`. Grid orders carry no `Builder`. Don't create your own orders with a `<bot_id>:` client ID prefix: a cancel-on-stop reconcile cancels every active order on that account+symbol with that prefix. The grid service only matches orders on the bot's own account, so another account reusing a bot's (public) strategy IDs cannot affect it.
 
 ---
 
@@ -100,6 +100,7 @@ Bot ID: `grid-<account_id>-<symbol>-<uuidv7>`. Grid orders are ordinary orders o
 | `sl_price` | decimal | no | LONG: `< lower_price`; SHORT: `> upper_price`; not allowed for NEUTRAL |
 | `long_sl_price` / `short_sl_price` | decimal | no | NEUTRAL only: buy levels' SL `< lower_price` / sell levels' SL `> upper_price` |
 | `vault_id` / `sub_account_id` | string | no | Account selector (see above) |
+| `agent_thread_id`, `agent_message_id` | string (UUID), integer | no | Strike trading-agent chat context: when both are valid, the created bot is recorded on that chat message. Never affects the create; an unknown or non-UUID thread is ignored |
 
 Validation also requires:
 - **Fees**: `spacing > mid × (maker_rate + taker_rate)` using the account's effective fee tier (overrides, referral and staking discounts applied), `mid = (upper+lower)/2`.
@@ -173,6 +174,12 @@ Query: `limit` (default 100, max 500; `0`/negative → 100; non-integer → `400
   "grid_profit": "4.5",
   "grid_fees": "0.08",
   "grid_profit_net": "4.42",
+  "open_size": "0.0015",
+  "open_entry_notional": "94.5",
+  "open_entry_fees": "0.0189",
+  "unmatched_pnl": "2.6991",
+  "total_pnl": "7.1191",
+  "pnl_mark_price": "64812",
   "created_at_ms": 1779791713927,
   "updated_at_ms": 1780548161566
 }
@@ -183,9 +190,12 @@ Query: `limit` (default 100, max 500; `0`/negative → 100; non-integer → `400
 | `status` | string | `CREATED` \| `RUNNING` \| `STOPPING` \| `STOPPED` |
 | `leverage`, `grid_count` | number | `leverage` = snapshot used for sizing |
 | `orders` | array | Tracked levels (resting entries, held levels, closing levels); `[]` when none. Kept as-is after a `cancel_orders: false` stop |
-| `grid_profit` / `grid_fees` / `grid_profit_net` | decimal | Sum of recorded exits' per-level gross PnL / exit fees + entry-fee shares / difference. Omitted when history is unavailable (GET by id then returns `500`) |
+| `grid_profit` / `grid_fees` / `grid_profit_net` | decimal | Completed cycles: sum of recorded exits' per-level gross PnL / exit fees + entry-fee shares / difference. Omitted when history is unavailable (GET by id then returns `500`) |
+| `open_size`, `open_entry_notional`, `open_entry_fees` | decimal | Inventory the bot's own levels still hold: signed size (`+` buy levels, `−` sell levels; entered size − exit fills, `closing` levels excluded), signed Σ size × level entry price (seed VWAP for `MARKET_SEED`), and the entry fees that size still carries. Omitted when zero |
+| `unmatched_pnl`, `pnl_mark_price` | decimal | `open_size × pnl_mark_price − open_entry_notional − open_entry_fees` (recompute live with the same formula). `0` once `STOPPED` (inventory left at stop belongs to the account). Omitted without a mark price |
+| `total_pnl` | decimal | `grid_profit_net + unmatched_pnl`: the bot's whole result after fees, funding excluded; counts only the bot's own fills. Omitted when either term is |
 | `last_error` | string | Latest operational error (retries, failed create); cleared on a clean stop |
-| `stop_reason` | string | Set when the grid stopped the bot itself, e.g. `liquidation closed grid inventory (fill 123)`, `aggregate market seed expired without fills: <reason>`; survives `STOPPED` |
+| `stop_reason` | string | Set when the grid stopped the bot itself, e.g. `liquidation closed grid inventory (fill 123)`, `aggregate market seed <order status> without fills: <reason>`; survives `STOPPED` |
 | `cancel_on_stop` | bool | `true` while a cancel-orders stop is reconciling |
 | `market_seed` | object | MARKET_SEEDED only, until the seed finalizes: `strategy_id`, `order_id`, `target_size`, `filled_size`, `terminal` |
 
@@ -247,11 +257,11 @@ POST → SUBMITTED (API only) → CREATED → RUNNING → STOPPING → STOPPED
 | Grid service rejects before saving (balance, mark price) | never stored (`404`) | — | none |
 | LIMIT_ONLY entries published | `RUNNING` | — | `GRID_BOT_STARTED` (sent when published, before the engine accepts them) |
 | MARKET_SEEDED seed in flight | `RUNNING` + `market_seed` | — | none yet |
-| Seed filled, exits placed | `RUNNING` | — | `GRID_BOT_STARTED` with seed fields |
+| Seed fills reconciled (full or partial), exits placed | `RUNNING` | — | `GRID_BOT_STARTED` with seed fields |
 | Planning/validation failed in grid service, or nothing published | `STOPPED` | `last_error` | `GRID_BOT_FAILED` only |
 | LIMIT_ONLY: some entries failed to publish | `STOPPING` → `STOPPED` (cancels the rest) | `last_error` while stopping | `GRID_BOT_FAILED`, `GRID_BOT_STOPPED` |
 | MARKET_SEEDED: some resting entries failed to publish (seed fine) | `RUNNING` with fewer levels | `last_error` | none |
-| Seed FOK expired/rejected or failed to publish | `STOPPING` → `STOPPED` | `stop_reason` | `GRID_BOT_FAILED`, `GRID_BOT_STOPPED` |
+| Seed IOC ended with no fill (canceled, expired, rejected) or failed to publish | `STOPPING` → `STOPPED`, resting entries canceled | `stop_reason` | `GRID_BOT_FAILED`, `GRID_BOT_STOPPED` |
 | Entry or exit retries exhausted | `RUNNING` | `last_error`, level flags | `GRID_BOT_FAILED` (status `RUNNING`) |
 | Liquidation / ADL / bankruptcy / insurance-fund / vault-withdrawal / SLP-transfer fill closes grid inventory | `STOPPING` → `STOPPED` | `stop_reason` | `GRID_BOT_FILL` per level, `GRID_BOT_FAILED`, `GRID_BOT_STOPPED` |
 | User stop | `STOPPING` → `STOPPED` | — | `GRID_BOT_STOPPED` |
@@ -260,7 +270,7 @@ Auto-close handling: the fill is split across the account's bots on that symbol 
 
 ## Real-time: strategyUpdate
 
-Grid events arrive on the userstream (`wss://<host>/ws/user-api`, `userstream` channel of the bot's account — owned sub-account via `sub_account_id`, vault via `vault_id`, which is public and so exposes a vault bot's events to anyone; see **strike-userstream**). Entry fills produce no grid event — only the normal `ORDER_TRADE_UPDATE` with the grid client order ID.
+Grid events arrive on the userstream (`wss://<host>/ws/user-api`, `userstream` channel of the bot's account — owned sub-account via `sub_account_id`, vault via `vault_id`, which is public and so exposes a vault bot's events to anyone; add `"topics": ["strategy"]` to receive only strategy events; see **strike-userstream**). Entry fills produce no grid event — only the normal `ORDER_TRADE_UPDATE` with the grid client order ID.
 
 ```json
 { "e": "strategyUpdate", "E": 1780547995899, "s": "BTC-USD",
@@ -344,6 +354,7 @@ const pub = await (await fetch(`${BASE}/v2/grid/bot?account_id=${bot.account_id}
 - `cancel_orders` defaults to `false`: a bare `DELETE` leaves every grid order resting and unmanaged.
 - `DELETE /v2/order/cancel-all`, `/v2/orders/replace` and manual cancels hit grid orders too: canceled entries drop their level for good; canceled TP/SL are re-placed.
 - Closing the position manually cancels the reduce-only exits (`position_closed`) and removes those levels without re-grid; the bot keeps running.
-- `LIMIT_ONLY` LONG/SHORT never place levels on the "wrong" side of the creation mark, even after price moves there — use `MARKET_SEEDED` to start with inventory.
+- `LIMIT_ONLY` LONG/SHORT never place levels on the "wrong" side of the creation mark, even after price moves there — use `MARKET_SEEDED` to start with inventory. A partly filled seed runs with only the inventory it got.
+- `grid_profit_net` counts completed cycles only; a bot holding losing inventory can show a profit there. Use `total_pnl` for the bot's result.
 - Several bots on one symbol (or a bot plus manual trading) share one net position; reduce-only exits can then be canceled by the engine and levels lost.
 - Passing your own `account_id` on a read returns the redacted view; omit selectors (or use `sub_account_id` / leader `vault_id`) to see stop-loss and retry state.

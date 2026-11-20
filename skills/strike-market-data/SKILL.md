@@ -1,6 +1,6 @@
 ---
 name: strike-market-data
-description: Strike Finance public market data REST (https://<host>/price/v2/...) — depth, trades, premium index/funding, mark/index price, 24h tickers, market stats, exchange info, klines, sparklines, open interest, fear & greed, stablecoin and FX rates — plus an overview of the public price WebSocket. Use when fetching market data or building trading interfaces.
+description: Strike Finance public market data REST (https://<host>/price/v2/...) — depth, trades (with per-market seq and fromSeq refill), premium index/funding, funding interval and caps (fundingInfo), mark/index price, 24h tickers, market stats, exchange info, klines, sparklines, open interest, fear & greed, stablecoin and FX rates — plus an overview of the public price WebSocket. Use when fetching market data or building trading interfaces.
 ---
 
 # Strike Finance Market Data
@@ -17,8 +17,9 @@ Conventions:
 - Send the canonical symbol, e.g. `BTC-USD`. Most endpoints are **case-sensitive** (`btc-usd` gives `400 INVALID_SYMBOL`, or an empty result on `/v2/depth` and `/v2/trades`); `/v2/markPrice` and `/v2/indexPrice` also accept lowercase, `/v2/sparklines` upper-cases its filter.
 - Prices, sizes and rates are decimal **strings**; times are Unix ms **numbers**.
 - Errors: `{"code": "...", "msg": "..."}` with `MISSING_PARAMETER`, `INVALID_PARAMETER`, `INVALID_SYMBOL` (400), `INTERNAL_ERROR` (500), `SERVICE_UNAVAILABLE` (503). Exceptions: `/v2/marketStats` (400/500) and `/v2/sparklines` (500) return `{"error": "..."}`.
-- Endpoints marked *cached* use an in-process cache of about 5 s and set `X-Cache: HIT|MISS` (trades, single-symbol markPrice/indexPrice/ticker/24hr, klines, sparklines; exchangeInfo uses a non-expiring cache).
+- Endpoints marked *cached* use an in-process cache of about 5 s and set `X-Cache: HIT|MISS` (trades without `fromSeq`, single-symbol markPrice/indexPrice/ticker/24hr, klines, sparklines; exchangeInfo is rebuilt in the background every 2 s).
 - "Optional `symbol`" endpoints return one object with `symbol`, and an **array** for all markets without it (`/v2/ticker/24hr` without `symbol` lists only markets that have 24h data).
+- **Market list and grouping:** don't hard-code symbols. `GET https://<host>/v2/markets` (API host, no `/price`; see `strike-account`) lists every market with its engine rules, `asset_class` and `tags`; `/v2/exchangeInfo` and `/v2/fundingInfo` below also enumerate markets.
 
 ---
 
@@ -31,13 +32,13 @@ Public, no auth. Full reference (framing, keepalive, limits, payloads): `strike-
 {"method": "SUBSCRIBE", "params": ["btc-usd@depth", "btc-usd@trade"], "id": 2}
 ```
 
-Ack: `{"result": null, "id": 1}`. App ping `{"method":"ping","id":9}` → `{"id":9,"method":"pong"}`. The server sends a ping frame every 54 s; the 60 s read deadline is extended **only by pong frames** (not by your messages), so the client must answer pings (browsers/most libraries do automatically). **A frame can hold several JSON messages separated by `\n`.** Payloads don't name their stream, so last/`_mark`/`_index` klines (and `@markprice` vs `@markprice@1s`) for the same symbol need separate sockets.
+Ack: `{"result": null, "id": 1}`. App ping `{"method":"ping","id":9}` → `{"id":9,"method":"pong"}`. The server sends a ping frame every 54 s; the 60 s read deadline is extended **only by pong frames** (not by your messages), so the client must answer pings (browsers/most libraries do automatically). **A frame can hold several JSON messages separated by `\n`.** `markPriceUpdate` carries `stream` (`btc-usd@markprice`, `btc-usd@markprice@1s`, `!markprice@arr`); kline payloads don't, so last/`_mark`/`_index` klines for the same symbol and interval need separate sockets. A socket that falls 1024 messages behind on `@depth`, `@trade` or `!miniticker@arr` is closed (reconnect and re-snapshot).
 
 | Stream (`<s>` = `btc-usd`) | Event | Cadence |
 |----------------------------|-------|---------|
-| `<s>@depth` | `depthUpdate` | Top-20 level diffs, 100 ms flush, on change |
+| `<s>@depth` | `depthUpdate` | Full-book level diffs chained by `pu`, 100 ms flush, on change |
 | `<s>@bookticker` | `bookTicker` | Best bid/ask on each book update (≤ every 100 ms) |
-| `<s>@trade` | `trade` | Every trade |
+| `<s>@trade` | `trade` | Every trade, numbered per market by `seq` |
 | `<s>@markprice` / `!markprice@arr` | `markPriceUpdate` | 3 s |
 | `<s>@markprice@1s` | `markPriceUpdate` | Each price-engine tick (~1 s), newest only |
 | `<s>@indexprice` / `!indexprice@arr` | `indexPriceUpdate` | 3 s (deprecated) |
@@ -53,23 +54,27 @@ Order books: `strike-orderbook` (also the L3 market-by-order feed at `/v2/l3/sna
 
 ### GET /v2/depth — Orderbook Depth
 
-- `symbol` (required), `limit` levels per side (default 20, max 1000).
-- Not cached. Unknown symbol → empty book with `lastUpdateId: 0`.
+- `symbol` (required), `limit` levels per side (default **1000**; larger values allowed up to 65534; missing, non-numeric or <= 0 → 1000).
+- Not cached. Returns the full book the `<s>@depth` stream last published. Unknown symbol, or no book published yet for it → `200` with `lastUpdateId: 0` and empty arrays.
 
 ```json
 {"lastUpdateId": 93450741, "E": 1792438776570, "T": 1792432626597,
  "bids": [["82.55", "1.82"], ["82.5", "2.43"]], "asks": [["82.67", "39.31"], ["82.78", "50"]]}
 ```
 
-`lastUpdateId` = order-book update ID (same domain as WS `U`/`u`); `E` = response time; `T` = engine snapshot time; bids high→low, asks low→high.
+`lastUpdateId` = the `u` of the last published `depthUpdate`; the next one has `pu == lastUpdateId`. `E` = response time; `T` = matching-engine time of that book (response time when nothing has been published); bids high→low, asks low→high. Levels never have zero size. Local-book sync: `strike-orderbook`.
 
 ### GET /v2/trades — Recent Trades
 
-- `symbol` (required), `limit` (default 100, max 1000). Newest first; only the latest 1000 trades are kept. *Cached.*
+- `symbol` (required), `limit` (default 100, max 1000). Newest first; only the latest 1000 trades per market are kept. *Cached* (except with `fromSeq`).
+- `fromSeq` (optional, non-negative integer, else `400 INVALID_PARAMETER "fromSeq must be a non-negative integer"`): return the **oldest** `limit` trades with `seq >= fromSeq`, still newest first. Use it to refill a gap seen on the `@trade` stream; repeat from the highest `seq` returned + 1 until the response is empty.
 
 ```json
-[{"id": 18071, "price": "77117.60", "qty": "0.0099", "quoteQty": "763.464240", "time": 1792172831028, "isBuyerMaker": true}]
+[{"id": 18071, "seq": 812, "price": "77117.60", "qty": "0.0099", "quoteQty": "763.464240", "time": 1792172831028, "isBuyerMaker": true, "order_type": "fill"}]
 ```
+
+- `id` is exchange-wide (a market's IDs increase but skip). `seq` is the trade's number on its market, +1 per trade, same as WS `trade.seq`; omitted for a trade the stream has not published yet.
+- `order_type`: `fill`, `liquidation` (taker was a position being liquidated) or `adl` (auto-deleveraging at a settlement price, off the book; the force-closed side is the taker). ADL trades are listed and numbered but left out of candles, last price and 24h volume.
 
 ### GET /v2/premiumIndex — Premium Index / Funding Window
 
@@ -82,7 +87,14 @@ Order books: `strike-orderbook` (also the L3 market-by-order feed at `/v2/l3/sna
  "interestRate": "0.0001", "interestRateDampener": "0.0005", "fundingMultiplier": "1", "time": 1792438625706}
 ```
 
-`latestPremiumIndex`/`averagePremiumIndex`/`premiumIndexCount` describe the active funding window (samples every 5 s; `latestPremiumIndex` is `"0"` before the first sample). `fundingRate` is the rate estimated from that window.
+Funding is hourly: the active window is the current UTC hour and `nextFundingTime` is its end. `latestPremiumIndex`/`averagePremiumIndex`/`premiumIndexCount` describe that window (samples nominally every 5 s; `averagePremiumIndex` is duration-weighted; all are `"0"`/`0` at the start of each hour). `fundingRate` is the live **hourly** estimate (same as WS `r`); with no samples yet it is the interest-only baseline. `interestRate`/`interestRateDampener` are 8-hour-basis inputs; `fundingMultiplier` scales the average premium. `time` = response time.
+
+### GET /v2/fundingInfo — Funding Interval and Limits
+
+- Optional `symbol`; unknown → `400 INVALID_SYMBOL`; `503 SERVICE_UNAVAILABLE` while the price engine initializes. Without `symbol`: array sorted by symbol.
+- → `{"symbol": "BTC-USD", "fundingIntervalHours": 1, "fundingRateCap": "0.005", "fundingRateFloor": "-0.005"}`
+
+Cap and floor are per funding interval (hourly), the same unit as `fundingRate`/`r`: the market's 8-hour bounds ÷ 8. They are the running engine's settings (a changed setting shows after the price engine restarts).
 
 ### GET /v2/markPrice — Mark Price
 
@@ -92,7 +104,7 @@ Order books: `strike-orderbook` (also the L3 market-by-order feed at `/v2/l3/sna
 {"e": "markPriceUpdate", "E": 1792438629661, "s": "BTC-USD", "p": "81649.00853590", "i": "81886.56143616", "r": "0.0000125", "T": 1792440000000}
 ```
 
-`p` mark, `i` index, `r` funding rate, `T` next funding time.
+`p` mark, `i` index, `r` live hourly funding estimate, `T` next funding time (end of the current UTC hour). The REST object has no `stream` field (the WS payload does).
 
 ### GET /v2/indexPrice — Index Price
 
@@ -110,7 +122,7 @@ Order books: `strike-orderbook` (also the L3 market-by-order feed at `/v2/l3/sna
  "openTime": 1792352226669, "closeTime": 1792438626669, "firstId": 0, "lastId": 0, "count": 0}
 ```
 
-Built from 1m candles. `weightedAvgPrice` = `lastPrice`, `lastQty` = `"0"`, `firstId`/`lastId`/`count` = `0`, `openTime` = now − 24h, `closeTime` = now. A single-symbol request for a market with no 24h data returns its last price with zero change/volume.
+Built from 1m candles (ADL trades excluded). `weightedAvgPrice` = `lastPrice`, `lastQty` = `"0"`, `firstId`/`lastId`/`count` = `0`, `openTime` = now − 24h, `closeTime` = now. A single-symbol request for a market with no 24h data returns its last price with zero change/volume.
 
 ### GET /v2/ticker/price — Latest Price
 
@@ -139,10 +151,11 @@ Built from 1m candles. `weightedAvgPrice` = `lastPrice`, `lastQty` = `"0"`, `fir
 ```
 
 - `status`: `ACTIVE`, `PRE_TRADING`, `BREAK`, `CLOSED`; `active`/`visibleOnUI` true only when trading.
-- `category`: `Crypto` (subCategory `""`) or `TradFi` with `FX`, `Commodity`, `Equity`, `Index`.
+- `category`: `Crypto` (subCategory `""`) or `TradFi` with `FX`, `Commodity`, `Equity`, `Index`, derived from the market's `asset_class` (`crypto`, `fx`, `commodity`, `stock`, `index`), the same value `GET /v2/markets` serves. For finer grouping use `asset_class`/`tags` there.
 - `volume24h` = quote volume; `volumeBase24h` = base volume.
 - `nextFundingRate` is actually the **next funding time** (ms).
-- `openInterestBase` = sum of long + short position sizes (2× `/v2/openInterest`); `openInterest` = `openInterestBase` × mark price.
+- `openInterestBase` = one-sided open interest in base units (total long size = total short size), the same figure as `/v2/openInterest`; `openInterest` = `openInterestBase` × mark price (USD).
+- `createdAt` is Unix ms (`0` when unset).
 
 ### GET /v2/fearGreed — Sentiment Index
 
@@ -155,14 +168,14 @@ Display only. `value` integer 0–100; bands `<25` Extreme Fear, `<45` Fear, `<5
 
 ### GET /v2/exchangeInfo — Exchange Info
 
-No params. Built once and served from a non-expiring cache (`X-Cache`): **`serverTime` is when the cache was filled, not the current time**; don't use it for clock sync.
+No params. Rebuilt from the market configs every 2 s in the background and served from that cache (`X-Cache`): **`serverTime` is when the cached copy was built (up to ~2 s old)**; don't use it for clock sync.
 
 ```json
 {"timezone": "UTC", "serverTime": 1792351962498,
  "rateLimits": [{"rateLimitType": "REQUEST_WEIGHT", "interval": "MINUTE", "intervalNum": 1, "limit": 2400},
                 {"rateLimitType": "ORDERS", "interval": "MINUTE", "intervalNum": 1, "limit": 1200}],
  "symbols": [{"symbol": "BTC-USD", "pair": "BTC-USD", "contractType": "PERPETUAL", "status": "trading",
-   "baseAsset": "BTC", "quoteAsset": "USDT", "marginAsset": "USDT",
+   "baseAsset": "BTC", "quoteAsset": "USD", "marginAsset": "USD",
    "pricePrecision": 8, "quantityPrecision": 8, "baseAssetPrecision": 8, "quotePrecision": 8,
    "underlyingType": "COIN", "underlyingSubType": ["BTC"], "settlePlan": 0,
    "triggerProtect": "0.05", "liquidationFee": "0.0125", "limitTakeBound": "0.05", "marketTakeBound": "0.05",
@@ -172,18 +185,18 @@ No params. Built once and served from a non-expiring cache (`X-Cache`): **`serve
      {"filterType": "MARKET_LOT_SIZE", "maxQty": "120", "minQty": "0.00001", "stepSize": "0.00001"},
      {"filterType": "MIN_NOTIONAL", "notional": "100"}],
    "orderType": ["LIMIT", "MARKET", "STOP", "STOP_MARKET", "TAKE_PROFIT", "TAKE_PROFIT_MARKET"],
-   "timeInForce": ["GTC", "IOC", "FOK"]}]}
+   "timeInForce": ["GTC", "IOC", "ALO"]}]}
 ```
 
 - `status` is lowercase: `pre_trading`, `trading`, `break`, `close`.
-- `quoteAsset`/`marginAsset` are always `"USDT"` (placeholders; markets are USD-quoted). `rateLimits`, `orderType`, `timeInForce` are static lists.
+- `quoteAsset`/`marginAsset` are the symbol suffix after `-` (`BTC-USD` → `USD`). `rateLimits` and `orderType` are static lists; `timeInForce` is every engine TIF (`GTC`, `IOC`, `ALO`).
 - `LOT_SIZE` applies to limit orders, `MARKET_LOT_SIZE` to market orders. `limitTakeBound`/`marketTakeBound` are the order price bounds.
 
 ### GET /v2/klines — Candles
 
 - `symbol`, `interval` (required; `1m 3m 5m 15m 30m 1h 2h 4h 6h 8h 12h 1d 3d 1w 1M`), `startTime`, `endTime` (ms), `limit` (default 500, max 1500), `priceType` (`last` default, `mark`, `index`).
 - Returns `[[openTime, open, high, low, close, volume, closeTime, quoteVolume, trades, takerBuyBase, takerBuyQuote, "0"], ...]`, oldest first. Despite the names, columns 9/10 hold the volume of trades with `isBuyerMaker = true` (taker **sells**); taker-buy = `volume − col9` (quote: `quoteVolume − col10`).
-- *Cached* (`X-Cache`) unless the response includes the in-progress candle. Paging, gap filling and WS candles: `strike-klines`.
+- ADL trades are not in `last` candles. *Cached* (`X-Cache`) unless the response includes the in-progress candle. Paging, gap filling and WS candles: `strike-klines`.
 
 ### GET /v2/sparklines — Mini-chart Series
 
@@ -218,6 +231,6 @@ Display only: daily ECB reference rates, units per 1 USD (`USD: "1"` included wh
 ## Important Notes
 
 - **Prefer WebSocket for live data**; use REST for snapshots and backfill.
-- Update IDs (`lastUpdateId`, `U`, `u`) are uint64; current values fit safely in a JS `number`.
-- `/v2/ticker/price` and `/v2/ticker/bookTicker` read the market record; `/v2/depth` reads the engine's book snapshot — they can briefly disagree.
+- Update IDs (`lastUpdateId`, `U`, `u`, `pu`) are uint64; current values fit safely in a JS `number`.
+- `/v2/ticker/price` and `/v2/ticker/bookTicker` read the market record; `/v2/depth` reads the book the depth stream last published — they can briefly disagree.
 - Response timestamps named `time`/`E` are usually the server response time, not the data's age; use `T` (depth) or the WS event times when freshness matters.

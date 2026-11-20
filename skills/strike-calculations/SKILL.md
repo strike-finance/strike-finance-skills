@@ -251,15 +251,16 @@ Positive rate: longs pay, shorts receive. Cross payments hit the wallet; isolate
 ```
 impactNotional = 50 * clamp(margin_tiers[0].max_leverage, 20, 50)          (served as impact_notional)
 impactBid/Ask  = impactNotional / qty needed to fill impactNotional on that side of the Strike book
-                 (falls back to index if unavailable or outside [0.8, 1.2] * index)
+                 (if either side is too thin, both use best bid / best ask; no two-sided book: P = 0)
 premium P      = (max(0, impactBid - index) - max(0, index - impactAsk)) / index    (sampled every 5 s)
-P_avg          = mean of samples in [HH-1h, HH)
+P_avg          = Σ(P_i * dt_i) / Σ dt_i over the window [HH-1h, HH)                 (time-weighted; dt_i = ms since the
+                 later of the previous sample and the window start)
 F8             = m * P_avg + clamp(I - m * P_avg, -m * D, +m * D)                   (= m * P_avg + I when D = 0)
 F8             = clamp(F8, floor, cap)
-hourlyRate     = F8 / 8
+hourlyRate     = round(F8 / 8, 12)
 ```
 
-Defaults when a market has no override: `I = 0.0001`, `D = 0.0005`, `m = 1`, `cap = 0.04`, `floor = -0.04`. The `funding_rate` on `/v2/markets` and the mark-price stream is the live hourly estimate. `/price/v2/premiumIndex` returns `fundingRate`, `interestRate`, `interestRateDampener`, `fundingMultiplier`, `averagePremiumIndex`.
+Defaults when a market has no override: `I = 0.0001`, `D = 0.0005`, `m = 1`, `cap = 0.04`, `floor = -0.04` (all 8-hour basis). A window with no samples pays nothing, and markets outside `Trading`/`Break` status are not charged. The `funding_rate` on `/v2/markets` and the mark-price stream is the live hourly estimate from the current window's samples so far (`P_avg = 0`, i.e. `I/8` with defaults, until the first sample of the hour). `/price/v2/premiumIndex` returns `fundingRate`, `interestRate`, `interestRateDampener`, `fundingMultiplier`, `averagePremiumIndex` (current window), `latestPremiumIndex`, `premiumIndexCount`; `/price/v2/fundingInfo[?symbol=]` returns `fundingIntervalHours` (`1`) and the hourly `fundingRateCap` / `fundingRateFloor` (= cap / floor ÷ 8).
 
 ## Fees
 
@@ -268,14 +269,16 @@ commission = round(fillPrice * fillSize * rate)                                 
 rate       = maker_fee_rate_override (final, may be negative = rebate)          for maker fills when set
              (set by the daily fee sync from maker_rebate_tiers or a per-account override)
            = bracketRate * (1 - referralDiscount) * (1 - stakingDiscount)       otherwise (discounts only on positive rates)
-builderFee = floor(fillPrice * fillSize * builderBps / 10000, 2 decimals)        (every fill, maker included)
+builderFee = min(floor(fillPrice * fillSize * builderBps / 10000, 8 decimals), capacity)   (every fill, maker included)
+capacity   = floor(max(0, walletBalance - Σ iso_balance + min(0, Σ cross uPnL)
+                          + [isolated position on this symbol: max(0, iso_balance + min(0, its uPnL))]), 8 decimals)
 ```
 
-- **Rebate cap:** a negative maker fee is capped per trade at the fee the protocol keeps from that trade's taker (`takerFee - takerFee * referralRewardRate`); with no taker fee the rebate is 0. Fill `fee` (`n` on the WebSocket) shows the capped value.
+- **Rebate cap:** a negative maker fee is capped per trade at the commission the protocol keeps from that trade's taker fee: `takerFee - takerFee * referralRewardRate - takerFee * tier2ReferralRewardRate - crates` (the taker's referral rates), where `crates = trunc(remainder * crateShare, 8 decimals)` (crate share is an engine setting, default 5%). With no taker fee the rebate is 0. Fill `fee` (`n` on the WebSocket) shows the capped value.
 
 - Bracket rates: `/v2/fee-tiers` -> `feeTiers` (`{"Tier":0,"MinVolume":0,"TakerRate":0.0005,"MakerRate":0}` -- PascalCase keys, numbers). Tier = largest `MinVolume` <= pooled 30-day volume (master + active sub-accounts), synced to the engine by a daily job; `fee_tier` on `/v2/portfolio` is the effective tier (includes per-account overrides).
 - `referralDiscount` ~= `fee_discount_rate / 100` from `/v2/portfolio` (that field is rounded to a whole percent); `stakingDiscount` = `staking_fee_discount_rate`.
-- Builder fee: sent via `X-Builder-Fee-Bps` (integer, 0 to the protocol max, default max 100 = 1%) on API-wallet requests whose wallet has a builder code; must also be `<=` the builder's configured share and the user's approved max, otherwise `400`. Not charged on liquidation fills.
+- Builder fee: sent via `X-Builder-Fee-Bps` (integer, 0 to the protocol max, default max 100 = 1%) on API-wallet requests whose wallet has a builder code; must also be `<=` the builder's configured share and the user's approved max (a sub-account without its own approval uses its master's), otherwise `400`. At fill time it is capped by `capacity` above (unrealized profit never counts), so a payer short of funds pays less or nothing; it is `0` when the builder's own account is the trader (the fill still carries the builder code). Not charged on liquidation fills.
 - Solvent liquidation fee (liquidation fills only): `floor(min(liquidation_fee_rate * price * size, liquidation_fee_retention_factor * max(0, dir * (price - neutralPrice) * size - commission)), quote_prec)`, paid to the SLP vault. Reported as `liquidation_fee` on fills.
 
 ## Full Example: Reproduce `/v2/positions` Locally
